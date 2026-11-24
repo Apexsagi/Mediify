@@ -2,13 +2,14 @@
 
 @layer base {
   :root {
-    --font-display: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-display: 'Geist', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-sans: 'Inter', 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
-    --color-navy: #0B1830;
+    --color-navy: #071D49;
     --color-blue: #2563EB;
     --color-teal: #0D9488;
-    --color-canvas: #F1F5F9;
+    --color-canvas: #F8FAFC;
+    --color-cyan: #22D3EE;
     --color-surface: #FFFFFF;
     --color-text: #0F172A;
     --color-muted: #64748B;
@@ -17,7 +18,7 @@
 
   body {
     font-family: var(--font-sans);
-    background-color: #F1F5F9;
+    background-color: #F8FAFC;
     color: #0F172A;
   }
 
@@ -34,7 +35,24 @@
   font-variant-numeric: tabular-nums;
 }
 
+.clinical-grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(34, 211, 238, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(34, 211, 238, 0.06) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+.clinical-grid-light {
+  background-image:
+    linear-gradient(to right, rgba(7, 29, 73, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(7, 29, 73, 0.04) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto !important;
+  }
   *, ::before, ::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;

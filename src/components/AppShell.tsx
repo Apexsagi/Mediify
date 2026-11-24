@@ -218,7 +218,7 @@ export const AppShell: React.FC<AppShellProps> = ({
     : allVisibleItems;
 
   return (
-    <div className="min-h-screen bg-[#F1F5F9] text-[#0F172A] flex">
+    <div className="min-h-screen bg-[#F8FAFC] text-[#0F172A] flex">
       {/* Mobile Sidebar Backdrop */}
       {mobileOpen && (
         <div
@@ -228,11 +228,11 @@ export const AppShell: React.FC<AppShellProps> = ({
         />
       )}
 
-      {/* Collapsible #0B1830 Primary Navy Sidebar */}
+      {/* Collapsible #071D49 Midnight Navy Sidebar */}
       <aside
         className={`${
           mobileOpen ? 'fixed inset-y-0 left-0 flex' : 'hidden lg:flex lg:sticky lg:top-0'
-        } z-50 h-screen bg-[#0B1830] text-slate-200 flex-col border-r border-white/10 ${
+        } z-50 h-screen bg-[#071D49] text-slate-200 flex-col border-r border-white/10 ${
           collapsed ? 'w-[68px]' : 'w-[260px]'
         }`}
       >

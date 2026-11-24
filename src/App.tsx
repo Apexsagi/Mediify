@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import { AppShell, type AppPageId } from './components/AppShell';
-import { AuthPages } from './components/AuthPages';
+import { AuthPages, type AuthViewMode } from './components/AuthPages';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { LandingPage } from './components/LandingPage';
 import { apiRequest, setSessionToken } from './lib/api';
@@ -97,11 +97,14 @@ const VALID_PAGES = new Set<AppPageId>([
   'settings',
 ]);
 
-function parseUrlRoute(): { screen: RootScreen; authMode: 'login' | 'register'; page: AppPageId; encounterId: string | null } {
+function parseUrlRoute(): { screen: RootScreen; authMode: AuthViewMode; page: AppPageId; encounterId: string | null } {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
   if (!path) return { screen: 'landing', authMode: 'login', page: 'dashboard', encounterId: null };
   if (path === 'login') return { screen: 'auth', authMode: 'login', page: 'dashboard', encounterId: null };
   if (path === 'register') return { screen: 'auth', authMode: 'register', page: 'dashboard', encounterId: null };
+  if (path === 'forgot-password') return { screen: 'auth', authMode: 'forgot', page: 'dashboard', encounterId: null };
+  if (path === 'reset-password') return { screen: 'auth', authMode: 'reset', page: 'dashboard', encounterId: null };
+  if (path === 'auth/callback') return { screen: 'auth', authMode: 'callback', page: 'dashboard', encounterId: null };
 
   const [seg1, seg2] = path.split('/');
   if (VALID_PAGES.has(seg1 as AppPageId)) {
@@ -118,7 +121,7 @@ function parseUrlRoute(): { screen: RootScreen; authMode: 'login' | 'register'; 
 export default function App() {
   const initial = parseUrlRoute();
   const [screen, setScreen] = useState<RootScreen>(initial.screen === 'workspace' ? 'auth' : initial.screen);
-  const [authMode, setAuthMode] = useState<'login' | 'register'>(initial.authMode);
+  const [authMode, setAuthMode] = useState<AuthViewMode>(initial.authMode);
   const [activePage, setActivePage] = useState<AppPageId>(initial.page);
   const [selectedEncounterId, setSelectedEncounterId] = useState<string | null>(initial.encounterId);
   const [user, setUser] = useState<UserProfile | null>(null);
@@ -191,26 +194,31 @@ export default function App() {
 
   if (screen === 'landing') {
     return (
-      <LandingPage
-        onOpenAuth={(mode) => {
-          setAuthMode(mode);
-          setScreen('auth');
-          syncHistory(mode === 'register' ? '/register' : '/login');
-        }}
-      />
+      <ErrorBoundary>
+        <LandingPage
+          onOpenAuth={(mode) => {
+            setAuthMode(mode);
+            setScreen('auth');
+            syncHistory(mode === 'register' ? '/register' : '/login');
+          }}
+        />
+      </ErrorBoundary>
     );
   }
 
   if (screen === 'auth' || !user) {
     return (
-      <AuthPages
-        initialMode={authMode}
-        onBackToLanding={() => {
-          setScreen('landing');
-          syncHistory('/');
-        }}
-        onAuthenticated={(u, isNew) => void handleAuthenticated(u, isNew)}
-      />
+      <ErrorBoundary>
+        <AuthPages
+          initialMode={authMode}
+          onBackToLanding={() => {
+            setScreen('landing');
+            syncHistory('/');
+          }}
+          onRouteChange={syncHistory}
+          onAuthenticated={(u, isNew) => void handleAuthenticated(u, isNew)}
+        />
+      </ErrorBoundary>
     );
   }
 

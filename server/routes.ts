@@ -111,12 +111,18 @@ export function createApiRouter(): Router {
   router.get('/auth/status', async (_req, res, next) => {
     try {
       const config = getSupabaseConfigurationStatus();
+      const googleOAuthEnabled = process.env.GOOGLE_OAUTH_ENABLED === 'true' && config.supabaseAuthConfigured;
+      const emailVerificationRequired = process.env.EMAIL_VERIFICATION_REQUIRED === 'true';
+
       if (!config.configured) {
         res.json({
           configured: false,
           missingVariables: config.missingVariables,
           hasUsers: false,
           hasOrganizations: false,
+          googleOAuthEnabled: false,
+          emailVerificationRequired,
+          supabasePublicConfig: null,
           syntheticSandboxAvailable: false,
         });
         return;
@@ -131,6 +137,14 @@ export function createApiRouter(): Router {
         missingVariables: [],
         hasUsers: Number(uRes.rows[0]?.c || 0) > 0,
         hasOrganizations: Number(oRes.rows[0]?.c || 0) > 0,
+        googleOAuthEnabled,
+        emailVerificationRequired,
+        supabasePublicConfig: config.supabaseAuthConfigured
+          ? {
+              url: process.env.SUPABASE_URL!.trim(),
+              anonKey: process.env.SUPABASE_ANON_KEY!.trim(),
+            }
+          : null,
         syntheticSandboxAvailable: false,
       });
     } catch (err) {
@@ -166,10 +180,36 @@ export function createApiRouter(): Router {
         return;
       }
 
-      // Optionally provision Supabase Auth user if configured
+      // Provision Supabase Auth user (respecting EMAIL_VERIFICATION_REQUIRED)
       let authUserId: string | null = null;
+      const requireVerification = process.env.EMAIL_VERIFICATION_REQUIRED === 'true';
       const supabaseAdmin = getSupabaseAdmin();
-      if (supabaseAdmin) {
+      const supabaseUrl = process.env.SUPABASE_URL?.trim();
+      const supabaseAnon = process.env.SUPABASE_ANON_KEY?.trim();
+      const redirectOrigin =
+        process.env.CUSTOM_DOMAIN_URL?.trim() ||
+        process.env.APP_URL?.trim() ||
+        `${req.protocol}://${req.get('host')}`;
+
+      if (requireVerification && supabaseUrl && supabaseAnon) {
+        const signUpResp = await fetch(`${supabaseUrl}/auth/v1/signup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', apikey: supabaseAnon },
+          body: JSON.stringify({
+            email,
+            password: parsed.data.password,
+            data: {
+              full_name: parsed.data.fullName.trim(),
+              credentials: parsed.data.credentials.trim(),
+            },
+            gotrue_meta_security: {},
+          }),
+        });
+        if (signUpResp.ok) {
+          const signUpJson = (await signUpResp.json()) as { id?: string; user?: { id?: string } };
+          authUserId = signUpJson.user?.id ?? signUpJson.id ?? null;
+        }
+      } else if (supabaseAdmin) {
         const createdAuth = await supabaseAdmin.auth.admin.createUser({
           email,
           password: parsed.data.password,
@@ -240,6 +280,25 @@ export function createApiRouter(): Router {
         return { orgId: createdOrgId, userId: createdUserId };
       });
 
+      if (requireVerification) {
+        await writeAuditLog({
+          organizationId: orgId,
+          userId,
+          userEmail: email,
+          action: 'ORGANIZATION_REGISTERED_PENDING_VERIFICATION',
+          resourceType: 'organization',
+          resourceId: orgId,
+          details: `Registered workspace for "${parsed.data.organizationName}" pending email confirmation (${redirectOrigin}).`,
+          ipAddress: req.ip,
+        });
+        res.status(201).json({
+          verificationRequired: true,
+          email,
+          message: 'Organization workspace provisioned. Confirm your email via the link sent to your inbox before signing in.',
+        });
+        return;
+      }
+
       const session = await createPersistedSession({
         userId,
         organizationId: orgId,
@@ -275,6 +334,372 @@ export function createApiRouter(): Router {
           is_active: true,
           created_at: new Date().toISOString(),
         },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Exchange Supabase OAuth / verified email JWT for revocable MEDIIFY session (or prompt OAuth org onboarding)
+  router.post('/auth/supabase-session', rateLimit(20, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({ accessToken: z.string().min(10) });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Valid Supabase access token is required.' });
+        return;
+      }
+
+      const supabaseAdmin = getSupabaseAdmin();
+      if (!supabaseAdmin) {
+        throw new ConfigurationRequiredError(
+          'Supabase Auth is not configured.',
+          ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'],
+        );
+      }
+
+      const { data, error } = await supabaseAdmin.auth.getUser(parsed.data.accessToken);
+      if (error || !data.user || !data.user.email) {
+        res.status(401).json({ error: 'Invalid or expired Supabase authentication token.' });
+        return;
+      }
+
+      const pool = getPgPool();
+      const email = data.user.email.trim().toLowerCase();
+      const userRes = await pool.query(
+        `SELECT id, auth_user_id, organization_id, email, full_name, role, credentials, mfa_enabled, is_active, created_at
+         FROM users WHERE auth_user_id = $1 OR LOWER(email) = $2 LIMIT 1`,
+        [data.user.id, email],
+      );
+      const user = userRes.rows[0];
+
+      if (!user) {
+        const metaName =
+          (data.user.user_metadata?.full_name as string | undefined) ||
+          (data.user.user_metadata?.name as string | undefined) ||
+          email.split('@')[0];
+        res.json({
+          needsOnboarding: true,
+          email,
+          fullName: metaName,
+          authUserId: data.user.id,
+        });
+        return;
+      }
+
+      if (!user.is_active) {
+        res.status(403).json({ error: 'Account is inactive. Contact your organization administrator.' });
+        return;
+      }
+
+      if (!user.auth_user_id) {
+        await pool.query('UPDATE users SET auth_user_id = $1 WHERE id = $2', [data.user.id, user.id]);
+      }
+
+      const session = await createPersistedSession({
+        userId: user.id,
+        organizationId: user.organization_id,
+        email: user.email,
+        role: user.role as UserRole,
+        mfaVerified: Boolean(user.mfa_enabled),
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+
+      await writeAuditLog({
+        organizationId: user.organization_id,
+        userId: user.id,
+        userEmail: user.email,
+        action: 'USER_LOGIN_SUPABASE_SSO',
+        resourceType: 'session',
+        resourceId: session.jti,
+        details: `User authenticated via Supabase SSO/OAuth (${user.role}).`,
+        ipAddress: req.ip,
+      });
+
+      res.json({
+        token: session.token,
+        expiresAt: session.expiresAt,
+        user: {
+          id: user.id,
+          organization_id: user.organization_id,
+          email: user.email,
+          full_name: user.full_name,
+          role: user.role,
+          credentials: user.credentials,
+          mfa_enabled: user.mfa_enabled,
+          is_active: user.is_active,
+          created_at: user.created_at,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Complete organization onboarding for newly authenticated Google / Supabase OAuth users
+  router.post('/auth/oauth-onboard', rateLimit(15, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({
+        accessToken: z.string().min(10),
+        organizationName: z.string().min(2).max(140),
+        npi: z.string().regex(/^\d{10}$/, 'Organization NPI must be 10 digits'),
+        taxId: z.string().min(4).max(24),
+        specialty: z.string().min(2).max(120),
+        fullName: z.string().min(2).max(120),
+        credentials: z.string().max(40).default(''),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid onboarding payload' });
+        return;
+      }
+
+      const supabaseAdmin = getSupabaseAdmin();
+      if (!supabaseAdmin) {
+        throw new ConfigurationRequiredError(
+          'Supabase Auth is not configured.',
+          ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'],
+        );
+      }
+
+      const { data, error } = await supabaseAdmin.auth.getUser(parsed.data.accessToken);
+      if (error || !data.user || !data.user.email) {
+        res.status(401).json({ error: 'Invalid or expired Supabase OAuth token.' });
+        return;
+      }
+
+      const email = data.user.email.trim().toLowerCase();
+      const pool = getPgPool();
+      const existing = await pool.query('SELECT id FROM users WHERE auth_user_id = $1 OR LOWER(email) = $2', [
+        data.user.id,
+        email,
+      ]);
+      if (existing.rows.length > 0) {
+        res.status(409).json({ error: 'Organization profile already exists for this account.' });
+        return;
+      }
+
+      const { orgId, userId } = await withTransaction(async (client) => {
+        const orgRes = await client.query(
+          `INSERT INTO organizations (name, npi, tax_id, specialty, retention_days, baa_attested, synthetic_mode, onboarding_completed)
+           VALUES ($1, $2, $3, $4, 2555, FALSE, FALSE, FALSE)
+           RETURNING id`,
+          [
+            parsed.data.organizationName.trim(),
+            parsed.data.npi,
+            parsed.data.taxId.trim(),
+            parsed.data.specialty.trim(),
+          ],
+        );
+        const createdOrgId = orgRes.rows[0].id as string;
+
+        const userRes = await client.query(
+          `INSERT INTO users (auth_user_id, organization_id, email, full_name, role, credentials, mfa_enabled, is_active)
+           VALUES ($1, $2, $3, $4, 'admin', $5, FALSE, TRUE)
+           RETURNING id`,
+          [data.user.id, createdOrgId, email, parsed.data.fullName.trim(), parsed.data.credentials.trim()],
+        );
+        const createdUserId = userRes.rows[0].id as string;
+
+        await client.query(
+          `INSERT INTO ai_model_configs (organization_id, display_name, provider_type, model_name, api_url, timeout_ms, max_tokens, is_active, approved_for_phi, baa_status, last_health_status, last_health_message)
+           VALUES
+             ($1, 'Google Gemini Clinical Extraction', 'gemini', 'gemini-2.5-flash', 'https://generativelanguage.googleapis.com', 35000, 8192, TRUE, FALSE, 'REQUIRES_BAA', 'UNKNOWN', 'Run health check to verify upstream reachability.'),
+             ($1, 'LingSante-3.1-air-VL (Primary Medical VLM)', 'lingsante', 'inclusionAI/LingSante-3.1-air-VL', '', 45000, 8192, FALSE, FALSE, 'REQUIRES_BAA', 'UNCONFIGURED', 'Configure LINGSANTE_API_URL and LINGSANTE_API_KEY.')`,
+          [createdOrgId],
+        );
+
+        await client.query(
+          `INSERT INTO integration_configs (organization_id, vendor_name, integration_type, endpoint_url, auth_method, connection_status, permissions_scope)
+           VALUES
+             ($1, 'X12 270/271 Clearinghouse Eligibility', 'CLEARINGHOUSE_X12', '', 'OAuth 2.0 Client Credentials + mTLS', 'CONFIGURATION_REQUIRED', 'eligibility.270 eligibility.271 claims.837'),
+             ($1, 'Epic Systems (SMART on FHIR R4)', 'EHR_FHIR_R4', '', 'OAuth 2.0 SMART Backend Services', 'CONFIGURATION_REQUIRED', 'patient/*.read encounter/*.read documentreference/*.read')`,
+          [createdOrgId],
+        );
+
+        return { orgId: createdOrgId, userId: createdUserId };
+      });
+
+      const session = await createPersistedSession({
+        userId,
+        organizationId: orgId,
+        email,
+        role: 'admin',
+        mfaVerified: false,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+
+      await writeAuditLog({
+        organizationId: orgId,
+        userId,
+        userEmail: email,
+        action: 'ORGANIZATION_REGISTERED_OAUTH',
+        resourceType: 'organization',
+        resourceId: orgId,
+        details: `Onboarded empty workspace via OAuth for "${parsed.data.organizationName}" (NPI: ${parsed.data.npi}).`,
+        ipAddress: req.ip,
+      });
+
+      res.status(201).json({
+        token: session.token,
+        expiresAt: session.expiresAt,
+        user: {
+          id: userId,
+          organization_id: orgId,
+          email,
+          full_name: parsed.data.fullName.trim(),
+          role: 'admin',
+          credentials: parsed.data.credentials.trim(),
+          mfa_enabled: false,
+          is_active: true,
+          created_at: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Trigger Supabase password recovery email
+  router.post('/auth/forgot-password', rateLimit(10, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({ email: z.string().email() });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Valid email address is required.' });
+        return;
+      }
+
+      const supabaseUrl = process.env.SUPABASE_URL?.trim();
+      const supabaseAnon = process.env.SUPABASE_ANON_KEY?.trim();
+      if (!supabaseUrl || !supabaseAnon) {
+        throw new ConfigurationRequiredError(
+          'Supabase Auth is not configured for password recovery.',
+          ['SUPABASE_URL', 'SUPABASE_ANON_KEY'],
+        );
+      }
+
+      const origin =
+        process.env.CUSTOM_DOMAIN_URL?.trim() ||
+        process.env.APP_URL?.trim() ||
+        `${req.protocol}://${req.get('host')}`;
+
+      await fetch(`${supabaseUrl}/auth/v1/recover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: supabaseAnon },
+        body: JSON.stringify({
+          email: parsed.data.email.trim().toLowerCase(),
+          redirect_to: `${origin}/reset-password`,
+        }),
+      });
+
+      // Generic success message prevents email enumeration
+      res.json({
+        ok: true,
+        message: 'If an account matches that work email, password recovery instructions have been dispatched.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Complete password reset using Supabase recovery token
+  router.post('/auth/reset-password', rateLimit(10, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({
+        accessToken: z.string().min(10),
+        newPassword: z.string().min(12, 'Password must be at least 12 characters for healthcare accounts'),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid password reset request.' });
+        return;
+      }
+
+      const supabaseAdmin = getSupabaseAdmin();
+      if (!supabaseAdmin) {
+        throw new ConfigurationRequiredError(
+          'Supabase Auth is not configured.',
+          ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'],
+        );
+      }
+
+      const { data, error } = await supabaseAdmin.auth.getUser(parsed.data.accessToken);
+      if (error || !data.user || !data.user.email) {
+        res.status(401).json({ error: 'Recovery link is invalid or has expired. Request a new reset link.' });
+        return;
+      }
+
+      await supabaseAdmin.auth.admin.updateUserById(data.user.id, {
+        password: parsed.data.newPassword,
+      });
+
+      const pool = getPgPool();
+      const newHash = hashPassword(parsed.data.newPassword);
+      const email = data.user.email.trim().toLowerCase();
+      const updated = await pool.query(
+        `UPDATE users SET password_hash = $1
+         WHERE auth_user_id = $2 OR LOWER(email) = $3
+         RETURNING id, organization_id, email`,
+        [newHash, data.user.id, email],
+      );
+
+      if (updated.rows[0]) {
+        const u = updated.rows[0];
+        await pool.query('UPDATE user_sessions SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL', [
+          u.id,
+        ]);
+        await writeAuditLog({
+          organizationId: u.organization_id,
+          userId: u.id,
+          userEmail: u.email,
+          action: 'PASSWORD_RESET_COMPLETED',
+          resourceType: 'user',
+          resourceId: u.id,
+          details: 'User reset password via Supabase recovery flow; active sessions revoked.',
+          ipAddress: req.ip,
+        });
+      }
+
+      res.json({ ok: true, message: 'Password updated successfully. You may now sign in.' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Resend Supabase email confirmation link
+  router.post('/auth/resend-verification', rateLimit(10, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({ email: z.string().email() });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Valid email is required.' });
+        return;
+      }
+
+      const supabaseUrl = process.env.SUPABASE_URL?.trim();
+      const supabaseAnon = process.env.SUPABASE_ANON_KEY?.trim();
+      if (!supabaseUrl || !supabaseAnon) {
+        throw new ConfigurationRequiredError(
+          'Supabase Auth is not configured.',
+          ['SUPABASE_URL', 'SUPABASE_ANON_KEY'],
+        );
+      }
+
+      await fetch(`${supabaseUrl}/auth/v1/resend`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: supabaseAnon },
+        body: JSON.stringify({
+          type: 'signup',
+          email: parsed.data.email.trim().toLowerCase(),
+        }),
+      });
+
+      res.json({
+        ok: true,
+        message: 'Verification email dispatch requested. Check your inbox and spam folder.',
       });
     } catch (err) {
       next(err);

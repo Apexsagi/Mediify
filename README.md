@@ -46,7 +46,8 @@ Open `http://localhost:3000`. Create an organization account to initialize a cle
 ## Production Deployment & Compliance Checklist
 
 1. **Supabase / PostgreSQL:** Enforce SSL connections, Row-Level Security, and private bucket policies on `medical-records`.
-2. **LingSante-3.1-air-VL:** Host `inclusionAI/LingSante-3.1-air-VL` inside a HIPAA-eligible GPU VPC and configure `LINGSANTE_API_URL` and `LINGSANTE_API_KEY` server-side.
-3. **AMA CPT Licensing:** Execute a commercial CPT distribution license with the American Medical Association before importing CPT code sets.
-4. **Clearinghouse & EHR Integrations:** Configure `CLEARINGHOUSE_API_URL`, `CLEARINGHOUSE_CLIENT_ID`, `CLEARINGHOUSE_CLIENT_SECRET`, and SMART on FHIR R4 credentials before running live X12 270/271 eligibility checks or claim submissions.
-5. **HIPAA Governance:** Execute Business Associate Agreements (BAAs) with Supabase/cloud infrastructure, clearinghouse, and AI model hosting vendors before ingesting live ePHI.
+2. **Vercel & Custom Domain Deployment:** `vercel.json` and `api/index.ts` route `/api/*` serverless endpoints and SPA routes cleanly. Configure `CUSTOM_DOMAIN_URL`, `APP_URL`, `SUPABASE_*`, `DATABASE_URL`, `SESSION_SECRET`, `GOOGLE_OAUTH_ENABLED`, and `EMAIL_VERIFICATION_REQUIRED` in Vercel Project Settings, then add your custom domain's `/auth/callback` and `/reset-password` URLs to Supabase Auth Redirect URLs.
+3. **LingSante-3.1-air-VL:** Host `inclusionAI/LingSante-3.1-air-VL` inside a HIPAA-eligible GPU VPC and configure `LINGSANTE_API_URL` and `LINGSANTE_API_KEY` server-side.
+4. **AMA CPT Licensing:** Execute a commercial CPT distribution license with the American Medical Association before importing CPT code sets.
+5. **Clearinghouse & EHR Integrations:** Configure `CLEARINGHOUSE_API_URL`, `CLEARINGHOUSE_CLIENT_ID`, `CLEARINGHOUSE_CLIENT_SECRET`, and SMART on FHIR R4 credentials before running live X12 270/271 eligibility checks or claim submissions.
+6. **HIPAA Governance:** Execute Business Associate Agreements (BAAs) with Supabase/cloud infrastructure, clearinghouse, and AI model hosting vendors before ingesting live ePHI.

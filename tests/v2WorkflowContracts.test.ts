@@ -76,3 +76,16 @@ test('local SQLite database directory and server/db.ts are completely removed', 
   assert.equal(fs.existsSync(path.join(ROOT, 'data/mediify.db')), false);
   assert.equal(fs.existsSync(path.join(ROOT, 'server/db.ts')), false);
 });
+
+test('Vercel serverless deployment, custom favicon, and Supabase Auth routes are configured', () => {
+  assert.equal(fs.existsSync(path.join(ROOT, 'vercel.json')), true);
+  assert.equal(fs.existsSync(path.join(ROOT, 'api/index.ts')), true);
+  assert.equal(fs.existsSync(path.join(ROOT, 'public/favicon.svg')), true);
+
+  const routesSrc = fs.readFileSync(path.join(ROOT, 'server/routes.ts'), 'utf8');
+  assert.ok(routesSrc.includes('/auth/supabase-session'));
+  assert.ok(routesSrc.includes('/auth/oauth-onboard'));
+  assert.ok(routesSrc.includes('/auth/forgot-password'));
+  assert.ok(routesSrc.includes('/auth/reset-password'));
+  assert.ok(routesSrc.includes('/auth/resend-verification'));
+});
