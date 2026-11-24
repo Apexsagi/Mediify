@@ -1327,6 +1327,103 @@ export const CodingWorkspaceView: React.FC<CodingWorkspaceViewProps> = ({
         </section>
       </div>
 
+      {/* Deterministic Coding Validation Status Footer Bar */}
+      {(() => {
+        const hasErrors = (cats: string[]) =>
+          validations.some((v) => cats.includes(v.rule_category) && v.severity === 'ERROR');
+        const hasWarnings = (cats: string[]) =>
+          validations.some((v) => cats.includes(v.rule_category) && v.severity === 'WARNING');
+        const hasPass = (cats: string[]) =>
+          validations.some((v) => cats.includes(v.rule_category) && v.severity === 'PASS');
+
+        const checks = [
+          {
+            label: 'Code Specificity',
+            state:
+              recommendations.length === 0
+                ? 'Pending'
+                : hasErrors(['LATERALITY', 'CODE_EFFECTIVE_DATE', 'CATALOG_VERIFICATION'])
+                  ? 'Attention'
+                  : 'Verified',
+          },
+          {
+            label: 'NCCI Edit Check',
+            state:
+              recommendations.length === 0
+                ? 'Pending'
+                : hasErrors(['NCCI_PTP'])
+                  ? 'Conflict'
+                  : hasWarnings(['NCCI_PTP', 'MISSING_REFERENCE_DATASET'])
+                    ? 'Review'
+                    : 'Passed',
+          },
+          {
+            label: 'MUE Check',
+            state:
+              recommendations.length === 0
+                ? 'Pending'
+                : hasErrors(['MUE'])
+                  ? 'Exceeded'
+                  : 'Within Limit',
+          },
+          {
+            label: 'Medical Necessity',
+            state:
+              recommendations.length === 0
+                ? 'Pending'
+                : hasErrors(['LCD_NCD_MEDICAL_NECESSITY'])
+                  ? 'Gap Flagged'
+                  : hasPass(['LCD_NCD_MEDICAL_NECESSITY'])
+                    ? 'Supported'
+                    : 'Review',
+          },
+          {
+            label: 'Payer Policy',
+            state:
+              eligibility?.x12_271_status === 'VERIFIED_ACTIVE'
+                ? '271 Active'
+                : eligibility?.x12_271_status === 'VERIFIED_INACTIVE'
+                  ? 'Inactive'
+                  : 'Unverified 271',
+          },
+        ];
+
+        const allReviewedClear =
+          recommendations.length > 0 &&
+          validations.every((v) => v.severity === 'PASS') &&
+          denialRisks.filter((r) => r.review_status === 'OPEN').length === 0;
+
+        return (
+          <div className="bg-white border border-[#E2E8F0] rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <span className="font-display font-bold text-[#06152B]">Coding Validation Status</span>
+            <div className="flex flex-wrap items-center gap-4">
+              {checks.map((chk) => (
+                <span key={chk.label} className="inline-flex items-center gap-1.5 text-slate-700">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      ['Verified', 'Passed', 'Within Limit', 'Supported', '271 Active'].includes(chk.state)
+                        ? 'bg-[#0D9488]'
+                        : ['Conflict', 'Exceeded', 'Gap Flagged', 'Inactive'].includes(chk.state)
+                          ? 'bg-[#DC2626]'
+                          : 'bg-[#D97706]'
+                    }`}
+                  />
+                  <span className="font-medium">{chk.label}:</span>
+                  <span className="font-mono text-[11px] text-[#64748B]">{chk.state}</span>
+                </span>
+              ))}
+            </div>
+            <span
+              className={`font-semibold px-2.5 py-1 rounded ${
+                allReviewedClear ? 'bg-teal-50 text-[#0D9488]' : 'bg-slate-100 text-[#06152B]'
+              }`}
+            >
+              {allReviewedClear ? 'Deterministic Checks Clear' : 'Review Required'}
+            </span>
+          </div>
+        );
+      })()}
+
       {/* Modify Recommendation Modal */}
       {editingRec && (
         <div className="fixed inset-0 bg-slate-900/50 z-50 flex items-center justify-center p-4">

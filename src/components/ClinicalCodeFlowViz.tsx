@@ -187,9 +187,9 @@ export const ClinicalCodeFlowViz: React.FC = () => {
       <div className="px-6 py-4 border-b border-[#E2E8F0] bg-[#F8FAFC] flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
         <div>
           <p className="text-xs font-mono text-[#0D9488] font-medium">
-            Illustrative Workflow Demonstration · Non-PHI Example
+            Illustrative Architecture Walkthrough · Non-PHI Example
           </p>
-          <h3 className="font-display text-lg font-bold text-[#071D49] mt-0.5">{scenario.title}</h3>
+          <h3 className="font-display text-lg font-bold text-[#06152B] mt-0.5">{scenario.title}</h3>
         </div>
 
         <div role="tablist" aria-label="Interactive platform workflow demonstration" className="flex flex-wrap gap-1.5 bg-white p-1 border border-[#E2E8F0] rounded-lg">
@@ -204,8 +204,8 @@ export const ClinicalCodeFlowViz: React.FC = () => {
                 onClick={() => setActiveId(item.id)}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   active
-                    ? 'bg-[#071D49] text-white'
-                    : 'text-[#64748B] hover:text-[#071D49] hover:bg-slate-50'
+                    ? 'bg-[#06152B] text-white'
+                    : 'text-[#64748B] hover:text-[#06152B] hover:bg-slate-50'
                 }`}
               >
                 {item.tabLabel}

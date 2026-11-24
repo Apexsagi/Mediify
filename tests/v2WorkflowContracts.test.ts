@@ -88,4 +88,23 @@ test('Vercel serverless deployment, custom favicon, and Supabase Auth routes are
   assert.ok(routesSrc.includes('/auth/forgot-password'));
   assert.ok(routesSrc.includes('/auth/reset-password'));
   assert.ok(routesSrc.includes('/auth/resend-verification'));
+  assert.ok(routesSrc.includes('/public/leads'));
+  assert.ok(routesSrc.includes('/public/newsletter'));
+  assert.ok(routesSrc.includes('/team/invitations'));
+  assert.ok(routesSrc.includes('/admin/leads'));
 });
+
+test('Enterprise migration 004 and SEO assets exist cleanly', () => {
+  const schema004 = fs.readFileSync(
+    path.join(ROOT, 'supabase/migrations/004_enterprise_marketing_and_onboarding.sql'),
+    'utf8',
+  );
+  assert.ok(schema004.includes('organization_type'));
+  assert.ok(schema004.includes('team_invitations'));
+  assert.ok(schema004.includes('marketing_leads'));
+  assert.ok(schema004.includes('newsletter_subscriptions'));
+  assert.equal(fs.existsSync(path.join(ROOT, 'public/og-image.svg')), true);
+  assert.equal(fs.existsSync(path.join(ROOT, 'public/robots.txt')), true);
+  assert.equal(fs.existsSync(path.join(ROOT, 'public/sitemap.xml')), true);
+});
+

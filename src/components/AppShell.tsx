@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { apiRequest } from '../lib/api';
 import type { Organization, UserProfile, UserRole } from '../lib/types';
+import { MediifyLogo } from './MediifyLogo';
 
 export type AppPageId =
   | 'dashboard'
@@ -228,11 +229,11 @@ export const AppShell: React.FC<AppShellProps> = ({
         />
       )}
 
-      {/* Collapsible #071D49 Midnight Navy Sidebar */}
+      {/* Collapsible #06152B Midnight Navy Sidebar */}
       <aside
         className={`${
           mobileOpen ? 'fixed inset-y-0 left-0 flex' : 'hidden lg:flex lg:sticky lg:top-0'
-        } z-50 h-screen bg-[#071D49] text-slate-200 flex-col border-r border-white/10 ${
+        } z-50 h-screen bg-[#06152B] text-slate-200 flex-col border-r border-white/10 ${
           collapsed ? 'w-[68px]' : 'w-[260px]'
         }`}
       >
@@ -241,9 +242,9 @@ export const AppShell: React.FC<AppShellProps> = ({
             <button
               type="button"
               onClick={() => onNavigate('dashboard')}
-              className="font-display text-base font-bold tracking-tight text-white whitespace-nowrap cursor-pointer"
+              className="cursor-pointer"
             >
-              MEDIIFY
+              <MediifyLogo variant="light" compact />
             </button>
           )}
           <button
@@ -301,6 +302,16 @@ export const AppShell: React.FC<AppShellProps> = ({
             </div>
           ))}
         </nav>
+
+        {!collapsed && (
+          <div className="mx-3 mb-2 p-2.5 rounded-lg bg-[#0B2244] border border-[#22D3EE]/25 text-[11px]">
+            <p className="font-display font-bold text-white flex items-center gap-1.5">
+              <Cpu className="w-3.5 h-3.5 text-[#22D3EE]" />
+              <span>MEDIIFY AI</span>
+            </p>
+            <p className="font-mono text-[10px] text-[#22D3EE] mt-0.5">Analyze · Code · Verify · Prevent</p>
+          </div>
+        )}
 
         <div className="p-3 border-t border-white/10 shrink-0">
           {!collapsed ? (

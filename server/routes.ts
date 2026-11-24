@@ -41,6 +41,7 @@ import {
   runDeterministicCodingValidation,
 } from '../src/lib/codingValidator';
 import { MAX_CLINICAL_FILE_BYTES, validateClinicalUploadFile } from '../src/lib/fileValidator';
+import { validateNewsletterPayload, validatePublicLeadPayload } from '../src/lib/marketingAndModules';
 import { sanitizeClinicalDocument } from '../src/lib/promptSanitizer';
 import {
   buildOtpAuthUri,
@@ -152,12 +153,118 @@ export function createApiRouter(): Router {
     }
   });
 
+  // --- PUBLIC ENTERPRISE MARKETING LEADS & NEWSLETTER ---
+  router.post('/public/leads', rateLimit(15, 60_000), async (req, res, next) => {
+    try {
+      const parsed = validatePublicLeadPayload(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid submission payload' });
+        return;
+      }
+
+      const data = parsed.data;
+      const pool = getPgPool();
+      const webhookUrl = process.env.LEAD_NOTIFICATION_WEBHOOK_URL?.trim();
+      let notificationDispatched = false;
+      let notificationStatus = 'EMAIL_DISPATCH_UNCONFIGURED';
+
+      if (webhookUrl) {
+        try {
+          validateExternalInferenceUrl(webhookUrl);
+          const hookResp = await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              event: 'mediify_lead_submitted',
+              lead_type: data.lead_type,
+              full_name: data.full_name,
+              work_email: data.work_email,
+              organization_name: data.organization_name,
+              organization_type: data.organization_type,
+              submitted_at: new Date().toISOString(),
+            }),
+            signal: AbortSignal.timeout(5000),
+          });
+          notificationDispatched = hookResp.ok;
+          notificationStatus = hookResp.ok ? 'DISPATCHED' : `WEBHOOK_HTTP_${hookResp.status}`;
+        } catch {
+          notificationStatus = 'WEBHOOK_DISPATCH_FAILED';
+        }
+      }
+
+      const ins = await pool.query(
+        `INSERT INTO marketing_leads (
+          lead_type, full_name, work_email, organization_name, organization_type,
+          phone, monthly_encounters, ehr_system, message, source_path,
+          notification_dispatched, notification_status
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        RETURNING id, created_at`,
+        [
+          data.lead_type,
+          data.full_name,
+          data.work_email.toLowerCase(),
+          data.organization_name,
+          data.organization_type,
+          data.phone,
+          data.monthly_encounters,
+          data.ehr_system,
+          data.message,
+          data.source_path,
+          notificationDispatched,
+          notificationStatus,
+        ],
+      );
+
+      res.status(201).json({
+        id: ins.rows[0].id,
+        created_at: ins.rows[0].created_at,
+        notificationDispatched,
+        notificationStatus,
+        message:
+          data.lead_type === 'demo_request'
+            ? 'Demo request recorded in MEDIIFY. Our clinical & RCM implementation team will follow up via work email.'
+            : 'Contact inquiry recorded. Our enterprise team has received your message.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/public/newsletter', rateLimit(20, 60_000), async (req, res, next) => {
+    try {
+      const parsed = validateNewsletterPayload(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid email address' });
+        return;
+      }
+      const pool = getPgPool();
+      const email = parsed.data.email.toLowerCase();
+      await pool.query(
+        `INSERT INTO newsletter_subscriptions (email, organization_type, status)
+         VALUES ($1, $2, 'SUBSCRIBED')
+         ON CONFLICT (email) DO UPDATE SET status = 'SUBSCRIBED', organization_type = EXCLUDED.organization_type`,
+        [email, parsed.data.organization_type],
+      );
+      res.status(201).json({
+        subscribed: true,
+        email,
+        message: 'Subscribed to MEDIIFY regulatory coding & RCM briefings.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.post('/auth/register', rateLimit(20, 60_000), async (req, res, next) => {
     try {
       const schema = z.object({
         organizationName: z.string().min(2).max(140),
-        npi: z.string().regex(/^\d{10}$/, 'Organization NPI must be 10 digits'),
-        taxId: z.string().min(4).max(24),
+        organizationType: z
+          .enum(['hospital', 'clinic', 'asc', 'rcm_company', 'independent_coder'])
+          .optional()
+          .default('clinic'),
+        npi: z.string().regex(/^(\d{10}|SOLO-CODER|RCM-ORG)$/, 'Organization NPI must be 10 digits'),
+        taxId: z.string().min(2).max(24),
         specialty: z.string().min(2).max(120),
         fullName: z.string().min(2).max(120),
         email: z.string().email(),
@@ -228,11 +335,12 @@ export function createApiRouter(): Router {
 
       const { orgId, userId } = await withTransaction(async (client) => {
         const orgRes = await client.query(
-          `INSERT INTO organizations (name, npi, tax_id, specialty, retention_days, baa_attested, synthetic_mode, onboarding_completed)
-           VALUES ($1, $2, $3, $4, 2555, FALSE, $5, FALSE)
+          `INSERT INTO organizations (name, organization_type, npi, tax_id, specialty, retention_days, baa_attested, synthetic_mode, onboarding_completed)
+           VALUES ($1, $2, $3, $4, $5, 2555, FALSE, $6, FALSE)
            RETURNING id`,
           [
             parsed.data.organizationName.trim(),
+            parsed.data.organizationType,
             parsed.data.npi,
             parsed.data.taxId.trim(),
             parsed.data.specialty.trim(),
@@ -443,8 +551,12 @@ export function createApiRouter(): Router {
       const schema = z.object({
         accessToken: z.string().min(10),
         organizationName: z.string().min(2).max(140),
-        npi: z.string().regex(/^\d{10}$/, 'Organization NPI must be 10 digits'),
-        taxId: z.string().min(4).max(24),
+        organizationType: z
+          .enum(['hospital', 'clinic', 'asc', 'rcm_company', 'independent_coder'])
+          .optional()
+          .default('clinic'),
+        npi: z.string().regex(/^(\d{10}|SOLO-CODER|RCM-ORG)$/, 'Organization NPI must be 10 digits'),
+        taxId: z.string().min(2).max(24),
         specialty: z.string().min(2).max(120),
         fullName: z.string().min(2).max(120),
         credentials: z.string().max(40).default(''),
@@ -482,11 +594,12 @@ export function createApiRouter(): Router {
 
       const { orgId, userId } = await withTransaction(async (client) => {
         const orgRes = await client.query(
-          `INSERT INTO organizations (name, npi, tax_id, specialty, retention_days, baa_attested, synthetic_mode, onboarding_completed)
-           VALUES ($1, $2, $3, $4, 2555, FALSE, FALSE, FALSE)
+          `INSERT INTO organizations (name, organization_type, npi, tax_id, specialty, retention_days, baa_attested, synthetic_mode, onboarding_completed)
+           VALUES ($1, $2, $3, $4, $5, 2555, FALSE, FALSE, FALSE)
            RETURNING id`,
           [
             parsed.data.organizationName.trim(),
+            parsed.data.organizationType,
             parsed.data.npi,
             parsed.data.taxId.trim(),
             parsed.data.specialty.trim(),
@@ -3218,6 +3331,120 @@ export function createApiRouter(): Router {
       });
 
       res.status(201).json({ id: newUserId });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- TEAM INVITATIONS & ENTERPRISE LEAD MANAGEMENT ---
+  router.get('/team/invitations', requireAuth, requireRole('admin', 'coding_director'), async (req, res, next) => {
+    try {
+      const invitations = await withOrgTransaction(req.auth!.organizationId, async (client) => {
+        const r = await client.query(
+          `SELECT id, email, full_name, role, credentials, status, invited_by_email, expires_at, created_at
+           FROM team_invitations WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 50`,
+          [req.auth!.organizationId],
+        );
+        return r.rows;
+      });
+      res.json({ invitations });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/team/invitations', requireAuth, requireRole('admin', 'coding_director'), async (req, res, next) => {
+    try {
+      const schema = z.object({
+        email: z.string().email(),
+        full_name: z.string().min(2).max(120),
+        role: z.enum(['admin', 'coding_director', 'medical_coder', 'auditor', 'physician', 'rcm_analyst']),
+        credentials: z.string().max(40).default(''),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid invitation input' });
+        return;
+      }
+
+      const email = parsed.data.email.trim().toLowerCase();
+      const rawToken = crypto.randomBytes(24).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      const invitation = await withOrgTransaction(req.auth!.organizationId, async (client) => {
+        const ins = await client.query(
+          `INSERT INTO team_invitations (organization_id, email, full_name, role, credentials, token_hash, invited_by, invited_by_email, expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           RETURNING id, email, full_name, role, credentials, status, invited_by_email, expires_at, created_at`,
+          [
+            req.auth!.organizationId,
+            email,
+            parsed.data.full_name.trim(),
+            parsed.data.role,
+            parsed.data.credentials.trim(),
+            tokenHash,
+            req.auth!.userId,
+            req.auth!.email,
+            expiresAt,
+          ],
+        );
+        return ins.rows[0];
+      });
+
+      await writeAuditLog({
+        organizationId: req.auth!.organizationId,
+        userId: req.auth!.userId,
+        userEmail: req.auth!.email,
+        action: 'TEAM_INVITATION_CREATED',
+        resourceType: 'team_invitation',
+        resourceId: String(invitation.id),
+        details: `Created invitation for ${email} (${parsed.data.role}).`,
+        ipAddress: req.ip,
+      });
+
+      res.status(201).json({ invitation });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/admin/leads', requireAuth, requireRole('admin', 'coding_director'), async (_req, res, next) => {
+    try {
+      const pool = getPgPool();
+      const [leadsRes, newsRes] = await Promise.all([
+        pool.query(`SELECT * FROM marketing_leads ORDER BY created_at DESC LIMIT 100`),
+        pool.query(`SELECT COUNT(*)::int as c FROM newsletter_subscriptions WHERE status = 'SUBSCRIBED'`),
+      ]);
+      res.json({
+        leads: leadsRes.rows,
+        newsletterSubscribersCount: Number(newsRes.rows[0]?.c || 0),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.patch('/admin/leads/:id', requireAuth, requireRole('admin', 'coding_director'), async (req, res, next) => {
+    try {
+      const schema = z.object({
+        status: z.enum(['NEW', 'QUALIFIED', 'CONTACTED', 'ARCHIVED']),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Invalid lead status' });
+        return;
+      }
+      const pool = getPgPool();
+      const upd = await pool.query(
+        `UPDATE marketing_leads SET status = $1 WHERE id = $2 RETURNING id, status`,
+        [parsed.data.status, req.params.id],
+      );
+      if (upd.rows.length === 0) {
+        res.status(404).json({ error: 'Lead record not found' });
+        return;
+      }
+      res.json(upd.rows[0]);
     } catch (err) {
       next(err);
     }

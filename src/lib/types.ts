@@ -50,6 +50,7 @@ export type DenialRiskCategory =
 export interface Organization {
   id: string;
   name: string;
+  organization_type?: 'hospital' | 'clinic' | 'asc' | 'rcm_company' | 'independent_coder';
   npi: string;
   tax_id: string;
   specialty: string;
@@ -57,6 +58,36 @@ export interface Organization {
   baa_attested: number | boolean;
   synthetic_mode: number | boolean;
   onboarding_completed: number | boolean;
+  created_at: string;
+}
+
+export interface TeamInvitation {
+  id: string;
+  email: string;
+  full_name: string;
+  role: UserRole;
+  credentials: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REVOKED' | 'EXPIRED';
+  invited_by_email: string;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface MarketingLeadRecord {
+  id: string;
+  lead_type: 'demo_request' | 'contact_inquiry';
+  full_name: string;
+  work_email: string;
+  organization_name: string;
+  organization_type: string;
+  phone: string;
+  monthly_encounters: string;
+  ehr_system: string;
+  message: string;
+  source_path: string;
+  status: 'NEW' | 'QUALIFIED' | 'CONTACTED' | 'ARCHIVED';
+  notification_dispatched: boolean;
+  notification_status: string;
   created_at: string;
 }
 

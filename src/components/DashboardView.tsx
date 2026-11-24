@@ -158,6 +158,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ onOpenEncounter, o
 
   return (
     <div className="space-y-6">
+      {/* Executive Operational Banner (Zero Mock Metrics) */}
+      <div className="rounded-xl bg-gradient-to-r from-[#06152B] via-[#0B2752] to-[#0D9488]/90 text-white p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 border border-[#06152B]">
+        <div>
+          <p className="font-mono text-[11px] uppercase tracking-wider text-[#22D3EE]">MEDIIFY</p>
+          <h2 className="font-display text-lg sm:text-xl font-bold mt-0.5">
+            Clinical Coding &amp; Revenue Integrity Workspace
+          </h2>
+          <p className="text-xs text-slate-200 mt-1 max-w-2xl">
+            Operational counts and reviewed accuracy below reflect live PostgreSQL organization records only.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onNavigate('coding-workspace')}
+          className="px-4 py-2 text-xs font-semibold text-[#06152B] bg-[#22D3EE] hover:bg-cyan-300 rounded-md cursor-pointer whitespace-nowrap shrink-0 self-start sm:self-center"
+        >
+          Open Coding Workspace
+        </button>
+      </div>
+
       {/* Header & Filter Bar */}
       <div className="bg-white border border-[#E2E8F0] rounded-lg p-4 space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-3">

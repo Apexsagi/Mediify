@@ -1,7 +1,15 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Cpu, Link2, Lock, Plus, RefreshCw, ShieldAlert } from 'lucide-react';
+import { CheckCircle2, Cpu, Link2, Lock, MailPlus, Plus, RefreshCw, ShieldAlert } from 'lucide-react';
 import { apiRequest } from '../lib/api';
-import type { AIModelConfig, AuditLogEntry, IntegrationConfig, Organization } from '../lib/types';
+import { ORGANIZATION_TYPES, type OrganizationTypeId } from '../lib/marketingAndModules';
+import type {
+  AIModelConfig,
+  AuditLogEntry,
+  IntegrationConfig,
+  MarketingLeadRecord,
+  Organization,
+  TeamInvitation,
+} from '../lib/types';
 
 interface OrgViewProps {
   organization: Organization | null;
@@ -14,6 +22,7 @@ export const OrganizationSettingsView: React.FC<OrgViewProps & { isOnboarding?: 
   isOnboarding,
 }) => {
   const [name, setName] = useState(organization?.name ?? '');
+  const [orgType, setOrgType] = useState<OrganizationTypeId>(organization?.organization_type ?? 'clinic');
   const [npi, setNpi] = useState(organization?.npi ?? '');
   const [taxId, setTaxId] = useState(organization?.tax_id ?? '');
   const [specialty, setSpecialty] = useState(organization?.specialty ?? '');
@@ -23,9 +32,14 @@ export const OrganizationSettingsView: React.FC<OrgViewProps & { isOnboarding?: 
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
+  // Admin Lead & Newsletter Management state
+  const [leads, setLeads] = useState<MarketingLeadRecord[]>([]);
+  const [newsletterCount, setNewsletterCount] = useState<number>(0);
+
   useEffect(() => {
     if (organization) {
       setName(organization.name);
+      setOrgType(organization.organization_type ?? 'clinic');
       setNpi(organization.npi);
       setTaxId(organization.tax_id);
       setSpecialty(organization.specialty);
@@ -33,6 +47,24 @@ export const OrganizationSettingsView: React.FC<OrgViewProps & { isOnboarding?: 
       setBaaAttested(Boolean(organization.baa_attested));
     }
   }, [organization]);
+
+  async function loadLeads() {
+    try {
+      const res = await apiRequest<{ leads: MarketingLeadRecord[]; newsletterSubscribersCount: number }>(
+        '/admin/leads',
+      );
+      setLeads(res.leads);
+      setNewsletterCount(res.newsletterSubscribersCount);
+    } catch {
+      // Non-admin roles or initial load errors are safely ignored
+    }
+  }
+
+  useEffect(() => {
+    if (!isOnboarding) {
+      void loadLeads();
+    }
+  }, [isOnboarding]);
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -44,6 +76,7 @@ export const OrganizationSettingsView: React.FC<OrgViewProps & { isOnboarding?: 
         method: 'PUT',
         body: JSON.stringify({
           name,
+          organization_type: orgType,
           npi,
           tax_id: taxId,
           specialty,
@@ -61,128 +94,243 @@ export const OrganizationSettingsView: React.FC<OrgViewProps & { isOnboarding?: 
     }
   }
 
+  async function updateLeadStatus(id: string, status: MarketingLeadRecord['status']) {
+    await apiRequest(`/admin/leads/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    });
+    await loadLeads();
+  }
+
   return (
-    <div className="max-w-2xl bg-white border border-[#E2E8F0] rounded-lg p-6 space-y-5">
-      <div>
-        <h2 className="font-display text-base font-bold text-[#0B1830]">
-          {isOnboarding ? 'Organization Onboarding & Governance Setup' : 'Organization Settings & Retention Policy'}
-        </h2>
-        <p className="text-xs text-[#64748B] mt-1">
-          Configure group billing identifiers, HIPAA retention window, and Business Associate Agreement attestation.
-        </p>
+    <div className="space-y-6">
+      <div className="max-w-2xl bg-white border border-[#E2E8F0] rounded-lg p-6 space-y-5">
+        <div>
+          <h2 className="font-display text-base font-bold text-[#06152B]">
+            {isOnboarding ? 'Organization Onboarding & Governance Setup' : 'Organization Settings & Retention Policy'}
+          </h2>
+          <p className="text-xs text-[#64748B] mt-1">
+            Configure organization type, group billing identifiers, HIPAA retention window, and Business Associate
+            Agreement attestation.
+          </p>
+        </div>
+
+        {error && <div className="p-3 rounded bg-red-50 border border-red-200 text-xs text-[#DC2626]">{error}</div>}
+        {message && (
+          <div className="p-3 rounded bg-teal-50 border border-teal-200 text-xs text-[#0D9488] font-medium">
+            {message}
+          </div>
+        )}
+
+        <form onSubmit={handleSave} className="space-y-4 text-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="org-name" className="block font-medium text-slate-700 mb-1">
+                Organization Name
+              </label>
+              <input
+                id="org-name"
+                type="text"
+                required
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md"
+              />
+            </div>
+            <div>
+              <label htmlFor="org-type" className="block font-medium text-slate-700 mb-1">
+                Organization Type
+              </label>
+              <select
+                id="org-type"
+                value={orgType}
+                onChange={(e) => setOrgType(e.target.value as OrganizationTypeId)}
+                className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white"
+              >
+                {ORGANIZATION_TYPES.map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="org-npi" className="block font-medium text-slate-700 mb-1">
+                Group NPI (or SOLO-CODER / RCM-ORG)
+              </label>
+              <input
+                id="org-npi"
+                type="text"
+                required
+                pattern="^(\d{10}|SOLO-CODER|RCM-ORG)$"
+                value={npi}
+                onChange={(e) => setNpi(e.target.value)}
+                className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
+              />
+            </div>
+            <div>
+              <label htmlFor="org-tin" className="block font-medium text-slate-700 mb-1">
+                Tax ID / EIN
+              </label>
+              <input
+                id="org-tin"
+                type="text"
+                required
+                value={taxId}
+                onChange={(e) => setTaxId(e.target.value)}
+                className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="org-spec" className="block font-medium text-slate-700 mb-1">
+                Specialty Focus
+              </label>
+              <input
+                id="org-spec"
+                type="text"
+                required
+                value={specialty}
+                onChange={(e) => setSpecialty(e.target.value)}
+                className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md"
+              />
+            </div>
+            <div>
+              <label htmlFor="org-ret" className="block font-medium text-slate-700 mb-1">
+                Record Retention (Days)
+              </label>
+              <input
+                id="org-ret"
+                type="number"
+                min={365}
+                max={3650}
+                value={retentionDays}
+                onChange={(e) => setRetentionDays(Number(e.target.value))}
+                className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
+              />
+            </div>
+          </div>
+
+          <label className="flex items-start gap-2.5 p-3 rounded border border-[#E2E8F0] bg-[#F1F5F9] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={baaAttested}
+              onChange={(e) => setBaaAttested(e.target.checked)}
+              className="mt-0.5"
+            />
+            <span className="text-slate-700">
+              Attest that required Business Associate Agreements (BAAs) are executed with cloud infrastructure,
+              database, and AI model vendors prior to processing live patient ePHI.
+            </span>
+          </label>
+          <button
+            type="submit"
+            disabled={saving}
+            className="px-4 py-2 font-semibold text-white bg-[#06152B] hover:bg-[#0E274C] rounded-md cursor-pointer disabled:opacity-60"
+          >
+            {saving ? 'Saving...' : isOnboarding ? 'Complete Onboarding' : 'Save Settings'}
+          </button>
+        </form>
       </div>
 
-      {error && <div className="p-3 rounded bg-red-50 border border-red-200 text-xs text-[#DC2626]">{error}</div>}
-      {message && <div className="p-3 rounded bg-teal-50 border border-teal-200 text-xs text-[#0D9488] font-medium">{message}</div>}
+      {!isOnboarding && (
+        <div className="bg-white border border-[#E2E8F0] rounded-lg p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="font-display text-sm font-bold text-[#06152B]">
+                Enterprise Demo &amp; Contact Inquiries ({leads.length})
+              </h3>
+              <p className="text-xs text-[#64748B]">
+                Submitted public inquiries stored in PostgreSQL · Newsletter subscribers: {newsletterCount}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadLeads()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#E2E8F0] rounded-md hover:bg-slate-50 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Refresh Leads
+            </button>
+          </div>
 
-      <form onSubmit={handleSave} className="space-y-4 text-xs">
-        <div>
-          <label htmlFor="org-name" className="block font-medium text-slate-700 mb-1">
-            Organization Name
-          </label>
-          <input
-            id="org-name"
-            type="text"
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md"
-          />
+          {leads.length === 0 ? (
+            <p className="text-xs text-[#64748B] py-4">No demo requests or contact inquiries recorded yet.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-[#E2E8F0] bg-slate-50 text-[#64748B] text-left">
+                    <th className="py-2 px-3 font-semibold">Contact</th>
+                    <th className="py-2 px-3 font-semibold">Organization</th>
+                    <th className="py-2 px-3 font-semibold">Type</th>
+                    <th className="py-2 px-3 font-semibold">Dispatch</th>
+                    <th className="py-2 px-3 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {leads.map((lead) => (
+                    <tr key={lead.id}>
+                      <td className="py-2.5 px-3">
+                        <p className="font-semibold text-[#06152B]">{lead.full_name}</p>
+                        <p className="text-[#64748B]">{lead.work_email}</p>
+                      </td>
+                      <td className="py-2.5 px-3">
+                        <p className="text-slate-800">{lead.organization_name || '—'}</p>
+                        <p className="text-[11px] text-[#64748B]">{lead.organization_type}</p>
+                      </td>
+                      <td className="py-2.5 px-3 font-mono text-[11px]">{lead.lead_type}</td>
+                      <td className="py-2.5 px-3 font-mono text-[11px] text-[#64748B]">{lead.notification_status}</td>
+                      <td className="py-2.5 px-3">
+                        <select
+                          aria-label={`Status for ${lead.full_name}`}
+                          value={lead.status}
+                          onChange={(e) => void updateLeadStatus(lead.id, e.target.value as MarketingLeadRecord['status'])}
+                          className="px-2 py-1 border border-[#E2E8F0] rounded bg-white text-xs"
+                        >
+                          <option value="NEW">NEW</option>
+                          <option value="QUALIFIED">QUALIFIED</option>
+                          <option value="CONTACTED">CONTACTED</option>
+                          <option value="ARCHIVED">ARCHIVED</option>
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label htmlFor="org-npi" className="block font-medium text-slate-700 mb-1">
-              Group NPI (10 digits)
-            </label>
-            <input
-              id="org-npi"
-              type="text"
-              required
-              pattern="\d{10}"
-              value={npi}
-              onChange={(e) => setNpi(e.target.value)}
-              className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
-            />
-          </div>
-          <div>
-            <label htmlFor="org-tin" className="block font-medium text-slate-700 mb-1">
-              Tax ID / EIN
-            </label>
-            <input
-              id="org-tin"
-              type="text"
-              required
-              value={taxId}
-              onChange={(e) => setTaxId(e.target.value)}
-              className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
-            />
-          </div>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label htmlFor="org-spec" className="block font-medium text-slate-700 mb-1">
-              Specialty Focus
-            </label>
-            <input
-              id="org-spec"
-              type="text"
-              required
-              value={specialty}
-              onChange={(e) => setSpecialty(e.target.value)}
-              className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md"
-            />
-          </div>
-          <div>
-            <label htmlFor="org-ret" className="block font-medium text-slate-700 mb-1">
-              Record Retention (Days)
-            </label>
-            <input
-              id="org-ret"
-              type="number"
-              min={365}
-              max={3650}
-              value={retentionDays}
-              onChange={(e) => setRetentionDays(Number(e.target.value))}
-              className="w-full px-3 py-2 font-mono border border-[#E2E8F0] rounded-md"
-            />
-          </div>
-        </div>
-        <label className="flex items-start gap-2.5 p-3 rounded border border-[#E2E8F0] bg-[#F1F5F9] cursor-pointer">
-          <input
-            type="checkbox"
-            checked={baaAttested}
-            onChange={(e) => setBaaAttested(e.target.checked)}
-            className="mt-0.5"
-          />
-          <span className="text-slate-700">
-            Attest that required Business Associate Agreements (BAAs) are executed with cloud infrastructure, database, and AI model vendors prior to processing live patient ePHI.
-          </span>
-        </label>
-        <button
-          type="submit"
-          disabled={saving}
-          className="px-4 py-2 font-semibold text-white bg-[#0B1830] hover:bg-[#13264A] rounded-md cursor-pointer disabled:opacity-60"
-        >
-          {saving ? 'Saving...' : isOnboarding ? 'Complete Onboarding' : 'Save Settings'}
-        </button>
-      </form>
+      )}
     </div>
   );
 };
 
 export const TeamManagementView: React.FC = () => {
   const [users, setUsers] = useState<Array<Record<string, unknown>>>([]);
+  const [invitations, setInvitations] = useState<TeamInvitation[]>([]);
   const [showAdd, setShowAdd] = useState(false);
+  const [showInvite, setShowInvite] = useState(false);
   const [email, setEmail] = useState('');
   const [fullName, setFullName] = useState('');
   const [role, setRole] = useState('medical_coder');
   const [credentials, setCredentials] = useState('CPC');
   const [tempPw, setTempPw] = useState('');
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
 
   async function loadTeam() {
-    const res = await apiRequest<{ users: Array<Record<string, unknown>> }>('/team');
-    setUsers(res.users);
+    const [teamRes, invRes] = await Promise.all([
+      apiRequest<{ users: Array<Record<string, unknown>> }>('/team'),
+      apiRequest<{ invitations: TeamInvitation[] }>('/team/invitations').catch(() => ({ invitations: [] })),
+    ]);
+    setUsers(teamRes.users);
+    setInvitations(invRes.invitations);
   }
 
   useEffect(() => {
@@ -192,6 +340,7 @@ export const TeamManagementView: React.FC = () => {
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
     setError('');
+    setNotice('');
     try {
       await apiRequest('/team', {
         method: 'POST',
@@ -207,27 +356,65 @@ export const TeamManagementView: React.FC = () => {
       setEmail('');
       setFullName('');
       setTempPw('');
+      setNotice('Team member account created.');
       await loadTeam();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add team member');
     }
   }
 
+  async function handleSendInvitation(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    setNotice('');
+    try {
+      await apiRequest('/team/invitations', {
+        method: 'POST',
+        body: JSON.stringify({
+          email,
+          full_name: fullName,
+          role,
+          credentials,
+        }),
+      });
+      setShowInvite(false);
+      setEmail('');
+      setFullName('');
+      setNotice('Encrypted team invitation token generated and logged.');
+      await loadTeam();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create team invitation');
+    }
+  }
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-[#64748B]">Role-Based Access Control (RBAC) &amp; MFA status across organization staff.</p>
-        <button
-          type="button"
-          onClick={() => setShowAdd(true)}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#2563EB] rounded-md cursor-pointer"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          Add Team Member
-        </button>
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-[#64748B]">
+          Role-Based Access Control (RBAC), pending invitations, and MFA enrollment across organization staff.
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowInvite(true)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#06152B] bg-white border border-[#E2E8F0] hover:bg-slate-50 rounded-md cursor-pointer"
+          >
+            <MailPlus className="w-3.5 h-3.5 text-[#0D9488]" />
+            Send Invitation
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowAdd(true)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#2563EB] rounded-md cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Create User
+          </button>
+        </div>
       </div>
 
       {error && <div className="p-3 rounded bg-red-50 border border-red-200 text-xs text-[#DC2626]">{error}</div>}
+      {notice && <div className="p-3 rounded bg-teal-50 border border-teal-200 text-xs text-[#0D9488] font-medium">{notice}</div>}
 
       <div className="bg-white border border-[#E2E8F0] rounded-lg overflow-x-auto">
         <table className="w-full text-xs">
@@ -244,7 +431,7 @@ export const TeamManagementView: React.FC = () => {
           <tbody className="divide-y divide-slate-100">
             {users.map((u) => (
               <tr key={String(u.id)}>
-                <td className="py-3 px-4 font-medium text-[#0B1830]">{String(u.full_name)}</td>
+                <td className="py-3 px-4 font-medium text-[#06152B]">{String(u.full_name)}</td>
                 <td className="py-3 px-4 text-slate-700">{String(u.email)}</td>
                 <td className="py-3 px-4 font-medium capitalize">{String(u.role).replace(/_/g, ' ')}</td>
                 <td className="py-3 px-4 font-mono text-[#64748B]">{String(u.credentials || '—')}</td>
@@ -260,10 +447,85 @@ export const TeamManagementView: React.FC = () => {
         </table>
       </div>
 
+      {/* Team Invitations Table */}
+      <div className="bg-white border border-[#E2E8F0] rounded-lg p-5 space-y-3">
+        <h3 className="font-display text-sm font-bold text-[#06152B]">
+          Organization Team Invitations ({invitations.length})
+        </h3>
+        {invitations.length === 0 ? (
+          <p className="text-xs text-[#64748B]">No pending or historical team invitations.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-[#E2E8F0] text-[#64748B] text-left">
+                  <th className="py-2 font-semibold">Invitee</th>
+                  <th className="py-2 font-semibold">Role</th>
+                  <th className="py-2 font-semibold">Invited By</th>
+                  <th className="py-2 font-semibold">Status</th>
+                  <th className="py-2 font-semibold">Expires</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {invitations.map((inv) => (
+                  <tr key={inv.id}>
+                    <td className="py-2.5">
+                      <p className="font-medium text-[#06152B]">{inv.full_name}</p>
+                      <p className="text-[#64748B]">{inv.email}</p>
+                    </td>
+                    <td className="py-2.5 capitalize">{inv.role.replace(/_/g, ' ')}</td>
+                    <td className="py-2.5 text-[#64748B]">{inv.invited_by_email}</td>
+                    <td className="py-2.5 font-mono text-[#0D9488]">{inv.status}</td>
+                    <td className="py-2.5 font-mono text-[#64748B]">{inv.expires_at.slice(0, 10)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {showInvite && (
+        <div className="fixed inset-0 bg-slate-900/50 z-50 flex items-center justify-center p-4">
+          <form onSubmit={handleSendInvitation} className="bg-white border border-[#E2E8F0] rounded-lg max-w-md w-full p-6 space-y-3 text-xs">
+            <h3 className="font-display text-base font-bold text-[#06152B]">Send Team Invitation</h3>
+            <div>
+              <label htmlFor="inv-name" className="block font-medium text-slate-700 mb-1">Full Name</label>
+              <input id="inv-name" required value={fullName} onChange={(e) => setFullName(e.target.value)} className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md" />
+            </div>
+            <div>
+              <label htmlFor="inv-email" className="block font-medium text-slate-700 mb-1">Work Email</label>
+              <input id="inv-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md" />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label htmlFor="inv-role" className="block font-medium text-slate-700 mb-1">Role</label>
+                <select id="inv-role" value={role} onChange={(e) => setRole(e.target.value)} className="w-full px-2 py-2 border border-[#E2E8F0] rounded-md">
+                  <option value="medical_coder">Medical Coder</option>
+                  <option value="coding_director">Coding Director</option>
+                  <option value="auditor">Auditor</option>
+                  <option value="physician">Physician</option>
+                  <option value="rcm_analyst">RCM Analyst</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="inv-cred" className="block font-medium text-slate-700 mb-1">Credentials</label>
+                <input id="inv-cred" value={credentials} onChange={(e) => setCredentials(e.target.value)} className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md" />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button type="button" onClick={() => setShowInvite(false)} className="px-4 py-2 border border-[#E2E8F0] rounded-md cursor-pointer">Cancel</button>
+              <button type="submit" className="px-4 py-2 font-semibold text-white bg-[#0D9488] rounded-md cursor-pointer">Issue Invitation</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {showAdd && (
         <div className="fixed inset-0 bg-slate-900/50 z-50 flex items-center justify-center p-4">
           <form onSubmit={handleAdd} className="bg-white border border-[#E2E8F0] rounded-lg max-w-md w-full p-6 space-y-3 text-xs">
-            <h3 className="font-display text-base font-bold text-[#0B1830]">Invite Team Member</h3>
+            <h3 className="font-display text-base font-bold text-[#06152B]">Provision Team Member</h3>
             <div>
               <label htmlFor="tm-name" className="block font-medium text-slate-700 mb-1">Full Name</label>
               <input id="tm-name" required value={fullName} onChange={(e) => setFullName(e.target.value)} className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md" />
