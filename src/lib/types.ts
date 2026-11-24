@@ -1,0 +1,328 @@
+export type UserRole =
+  | 'admin'
+  | 'coding_director'
+  | 'medical_coder'
+  | 'auditor'
+  | 'physician'
+  | 'rcm_analyst';
+
+export type CertaintyStatus =
+  | 'confirmed'
+  | 'suspected'
+  | 'historical'
+  | 'negated'
+  | 'incomplete';
+
+export type CodeSystem = 'ICD-10-CM' | 'ICD-10-PCS' | 'CPT' | 'HCPCS' | 'MODIFIER';
+
+export type ValidationStatus = 'PASSED' | 'WARNING' | 'FAILED' | 'NEEDS_REVIEW';
+
+export type RiskSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+
+export type ApprovalAction = 'PENDING' | 'APPROVED' | 'MODIFIED' | 'REJECTED' | 'ESCALATED';
+
+export type InsuranceProvenance =
+  | 'VERIFIED_CLEARINGHOUSE'
+  | 'EXTRACTED_FROM_DOCUMENT'
+  | 'AI_SUGGESTION';
+
+export type AIProviderType =
+  | 'gemini'
+  | 'lingsante'
+  | 'huggingface'
+  | 'openai_compatible';
+
+export interface Organization {
+  id: string;
+  name: string;
+  npi: string;
+  tax_id: string;
+  specialty: string;
+  retention_days: number;
+  baa_attested: number;
+  synthetic_mode: number;
+  onboarding_completed: number;
+  created_at: string;
+}
+
+export interface UserProfile {
+  id: string;
+  organization_id: string;
+  email: string;
+  full_name: string;
+  role: UserRole;
+  credentials: string;
+  mfa_enabled: number;
+  is_active: number;
+  created_at: string;
+}
+
+export interface Patient {
+  id: string;
+  organization_id: string;
+  mrn: string;
+  first_name: string;
+  last_name: string;
+  dob: string;
+  sex: 'M' | 'F' | 'U';
+  city: string;
+  state: string;
+  is_synthetic: number;
+  created_at: string;
+}
+
+export interface Provider {
+  id: string;
+  organization_id: string;
+  npi: string;
+  full_name: string;
+  specialty: string;
+  credential: string;
+  network_status: 'IN_NETWORK' | 'OUT_OF_NETWORK' | 'UNVERIFIED';
+}
+
+export interface Encounter {
+  id: string;
+  organization_id: string;
+  patient_id: string;
+  provider_id: string;
+  encounter_number: string;
+  date_of_service: string;
+  encounter_type: 'Outpatient' | 'Inpatient' | 'Emergency' | 'Operative' | 'Telehealth';
+  place_of_service: string;
+  chief_complaint: string;
+  coding_status: 'PENDING_EXTRACTION' | 'NEEDS_CODING_REVIEW' | 'APPROVED' | 'ESCALATED' | 'CLAIM_READY';
+  is_synthetic: number;
+  created_at: string;
+  patient_name?: string;
+  patient_mrn?: string;
+  patient_dob?: string;
+  patient_sex?: 'M' | 'F' | 'U';
+  provider_name?: string;
+  provider_npi?: string;
+}
+
+export interface MedicalRecord {
+  id: string;
+  organization_id: string;
+  patient_id: string;
+  encounter_id: string;
+  document_type: string;
+  file_name: string;
+  mime_type: string;
+  page_count: number;
+  ocr_status: 'PENDING' | 'COMPLETED' | 'FAILED';
+  raw_text: string;
+  prompt_injection_flagged: number;
+  uploaded_by: string;
+  created_at: string;
+}
+
+export interface ExtractedEntity {
+  id: string;
+  organization_id: string;
+  encounter_id: string;
+  medical_record_id: string;
+  entity_type: 'diagnosis' | 'procedure' | 'symptom' | 'anatomy' | 'medication' | 'insurance' | 'provider';
+  entity_text: string;
+  normalized_concept: string;
+  certainty: CertaintyStatus;
+  laterality: 'LEFT' | 'RIGHT' | 'BILATERAL' | 'NONE' | 'UNSPECIFIED';
+  anatomical_site: string;
+  page_number: number;
+  evidence_snippet: string;
+  created_at: string;
+}
+
+export interface InsurancePolicy {
+  id: string;
+  organization_id: string;
+  patient_id: string;
+  priority: 'PRIMARY' | 'SECONDARY';
+  payer_name: string;
+  payer_id: string;
+  member_id: string;
+  group_number: string;
+  plan_name: string;
+  effective_date: string;
+  termination_date: string | null;
+  provenance: InsuranceProvenance;
+  is_active: number;
+}
+
+export interface EligibilityVerification {
+  id: string;
+  organization_id: string;
+  patient_id: string;
+  insurance_policy_id: string;
+  verification_source: InsuranceProvenance;
+  clearinghouse_transaction_id: string | null;
+  x12_270_payload: string | null;
+  x12_271_status: 'VERIFIED_ACTIVE' | 'VERIFIED_INACTIVE' | 'NOT_VERIFIED_REQUIRES_CLEARINGHOUSE' | 'ERROR';
+  copay_amount: number | null;
+  deductible_remaining: number | null;
+  coinsurance_percent: number | null;
+  prior_auth_required: number;
+  referral_required: number;
+  network_status: 'IN_NETWORK' | 'OUT_OF_NETWORK' | 'UNVERIFIED';
+  limitations_notes: string;
+  verified_at: string | null;
+  created_at: string;
+}
+
+export interface ReferenceCode {
+  code: string;
+  code_system: CodeSystem;
+  description: string;
+  category: string;
+  effective_date: string;
+  expiration_date: string | null;
+  requires_laterality: number;
+  valid_laterality: string | null;
+  age_min: number | null;
+  age_max: number | null;
+  sex_restriction: 'M' | 'F' | null;
+  mue_limit: number | null;
+  global_days: number | null;
+  prior_auth_typical: number;
+  is_billable: number;
+  guideline_reference: string;
+  license_notice: string | null;
+}
+
+export interface NcciEditRule {
+  id: string;
+  column1_code: string;
+  column2_code: string;
+  modifier_indicator: '0' | '1';
+  rationale: string;
+  effective_date: string;
+}
+
+export interface PayerPolicyRule {
+  id: string;
+  policy_code: string;
+  policy_type: 'LCD' | 'NCD' | 'PAYER_POLICY';
+  payer_name: string;
+  title: string;
+  procedure_codes: string[];
+  covered_icd10_codes: string[];
+  documentation_requirements: string;
+  timely_filing_days: number;
+  prior_auth_required: number;
+}
+
+export interface CodingRecommendation {
+  id: string;
+  organization_id: string;
+  encounter_id: string;
+  code: string;
+  code_system: CodeSystem;
+  description: string;
+  diagnosis_role: 'PRIMARY' | 'SECONDARY' | 'PROCEDURE' | 'MODIFIER';
+  diagnosis_pointers: string;
+  units: number;
+  modifiers: string;
+  supporting_evidence: string;
+  source_document: string;
+  page_reference: number;
+  coding_rationale: string;
+  guideline_citation: string;
+  documentation_completeness: 'COMPLETE' | 'PARTIAL' | 'MISSING_SPECIFICITY';
+  validation_status: ValidationStatus;
+  compliance_risk: string;
+  requires_human_review: number;
+  approval_status: ApprovalAction;
+  approved_by: string | null;
+  approved_at: string | null;
+  ai_provider: string;
+  created_at: string;
+}
+
+export interface CodingValidationResult {
+  id?: string;
+  encounter_id: string;
+  rule_category:
+    | 'NCCI_PTP'
+    | 'MUE'
+    | 'LCD_NCD_MEDICAL_NECESSITY'
+    | 'MODIFIER_COMPATIBILITY'
+    | 'LATERALITY'
+    | 'DUPLICATE_PROCEDURE'
+    | 'AGE_GENDER_RESTRICTION'
+    | 'GLOBAL_SURGERY'
+    | 'CODE_EFFECTIVE_DATE'
+    | 'CATALOG_VERIFICATION';
+  severity: 'ERROR' | 'WARNING' | 'PASS';
+  code_involved: string;
+  message: string;
+  policy_reference: string;
+  remediation: string;
+}
+
+export interface DenialRiskItem {
+  id?: string;
+  encounter_id: string;
+  risk_category: string;
+  severity: RiskSeverity;
+  supporting_evidence: string;
+  applicable_policy: string;
+  recommended_action: string;
+  review_status: 'OPEN' | 'MITIGATED' | 'DISMISSED';
+}
+
+export interface RevenueIntegrityFinding {
+  id?: string;
+  encounter_id: string;
+  finding_type: 'MISSED_BILLABLE_DOCUMENTED' | 'UNDERCODING' | 'OVERCODING_RISK' | 'DOCUMENTATION_GAP' | 'DUPLICATE_CHARGE';
+  code_involved: string;
+  summary: string;
+  clinical_evidence: string;
+  compliance_note: string;
+  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  status: 'OPEN' | 'ADDRESSED' | 'NOT_APPLICABLE';
+}
+
+export interface AIModelConfig {
+  id: string;
+  organization_id: string;
+  display_name: string;
+  provider_type: AIProviderType;
+  model_name: string;
+  api_url: string;
+  has_credentials: number;
+  timeout_ms: number;
+  max_tokens: number;
+  is_active: number;
+  approved_for_phi: number;
+  baa_status: 'NOT_APPLICABLE_SYNTHETIC' | 'BAA_EXECUTED' | 'REQUIRES_BAA';
+  last_health_status: 'HEALTHY' | 'UNCONFIGURED' | 'UNREACHABLE' | 'UNKNOWN';
+  last_health_message: string;
+  last_health_checked_at: string | null;
+}
+
+export interface IntegrationConfig {
+  id: string;
+  organization_id: string;
+  vendor_name: string;
+  integration_type: 'EHR_FHIR_R4' | 'CLEARINGHOUSE_X12' | 'OCR_SERVICE' | 'CUSTOM_REST';
+  endpoint_url: string;
+  auth_method: string;
+  connection_status: 'DISCONNECTED' | 'CONFIGURATION_REQUIRED' | 'VERIFIED_CONNECTED' | 'ERROR';
+  permissions_scope: string;
+  last_sync_at: string | null;
+  last_error: string | null;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  organization_id: string;
+  user_id: string;
+  user_email: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  details: string;
+  ip_address: string;
+  created_at: string;
+}

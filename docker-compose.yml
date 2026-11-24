@@ -1,0 +1,21 @@
+services:
+  mediify:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      - LINGSANTE_API_URL=${LINGSANTE_API_URL:-}
+      - LINGSANTE_API_KEY=${LINGSANTE_API_KEY:-}
+      - CLEARINGHOUSE_API_URL=${CLEARINGHOUSE_API_URL:-}
+      - CLEARINGHOUSE_CLIENT_ID=${CLEARINGHOUSE_CLIENT_ID:-}
+      - CLEARINGHOUSE_CLIENT_SECRET=${CLEARINGHOUSE_CLIENT_SECRET:-}
+    volumes:
+      - mediify_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  mediify_data:

@@ -1,0 +1,6 @@
+{
+  "name": "MEDIIFY",
+  "description": "AI-Powered Medical Coding & Revenue Cycle Intelligence. Clinical Intelligence. Coding Precision. Revenue Integrity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
