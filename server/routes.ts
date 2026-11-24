@@ -13,10 +13,12 @@ import {
   writeAuditLog,
 } from './auth';
 import {
+  assertSafeExternalUrlWithDns,
   checkAiProviderHealth,
   performMultimodalOcrExtraction,
   validateExternalInferenceUrl,
 } from './ai/providerRegistry';
+import { isPlatformAdminEmail, validateServerConfiguration } from './config';
 import {
   loadNcciRulesPg,
   loadPayerPoliciesPg,
@@ -170,23 +172,28 @@ export function createApiRouter(): Router {
 
       if (webhookUrl) {
         try {
-          validateExternalInferenceUrl(webhookUrl);
-          const hookResp = await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              event: 'mediify_lead_submitted',
-              lead_type: data.lead_type,
-              full_name: data.full_name,
-              work_email: data.work_email,
-              organization_name: data.organization_name,
-              organization_type: data.organization_type,
-              submitted_at: new Date().toISOString(),
-            }),
-            signal: AbortSignal.timeout(5000),
-          });
-          notificationDispatched = hookResp.ok;
-          notificationStatus = hookResp.ok ? 'DISPATCHED' : `WEBHOOK_HTTP_${hookResp.status}`;
+          const urlCheck = await assertSafeExternalUrlWithDns(webhookUrl);
+          if (!urlCheck.valid) {
+            notificationStatus = 'WEBHOOK_BLOCKED_SSRF';
+          } else {
+            const hookResp = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                event: 'mediify_lead_submitted',
+                lead_type: data.lead_type,
+                full_name: data.full_name,
+                work_email: data.work_email,
+                organization_name: data.organization_name,
+                organization_type: data.organization_type,
+                submitted_at: new Date().toISOString(),
+              }),
+              redirect: 'error',
+              signal: AbortSignal.timeout(5000),
+            });
+            notificationDispatched = hookResp.ok;
+            notificationStatus = hookResp.ok ? 'DISPATCHED' : `WEBHOOK_HTTP_${hookResp.status}`;
+          }
         } catch {
           notificationStatus = 'WEBHOOK_DISPATCH_FAILED';
         }
@@ -619,7 +626,9 @@ export function createApiRouter(): Router {
           `INSERT INTO ai_model_configs (organization_id, display_name, provider_type, model_name, api_url, timeout_ms, max_tokens, is_active, approved_for_phi, baa_status, last_health_status, last_health_message)
            VALUES
              ($1, 'Google Gemini Clinical Extraction', 'gemini', 'gemini-2.5-flash', 'https://generativelanguage.googleapis.com', 35000, 8192, TRUE, FALSE, 'REQUIRES_BAA', 'UNKNOWN', 'Run health check to verify upstream reachability.'),
-             ($1, 'LingSante-3.1-air-VL (Primary Medical VLM)', 'lingsante', 'inclusionAI/LingSante-3.1-air-VL', '', 45000, 8192, FALSE, FALSE, 'REQUIRES_BAA', 'UNCONFIGURED', 'Configure LINGSANTE_API_URL and LINGSANTE_API_KEY.')`,
+             ($1, 'LingSante-3.1-air-VL (Primary Medical VLM)', 'lingsante', 'inclusionAI/LingSante-3.1-air-VL', '', 45000, 8192, FALSE, FALSE, 'REQUIRES_BAA', 'UNCONFIGURED', 'Configure LINGSANTE_API_URL and LINGSANTE_API_KEY.'),
+             ($1, 'Hugging Face Medical Inference', 'huggingface', 'meta-llama/Llama-3.3-70B-Instruct', '', 45000, 4096, FALSE, FALSE, 'REQUIRES_BAA', 'UNCONFIGURED', 'Configure dedicated inference URL and HUGGINGFACE_API_TOKEN.'),
+             ($1, 'VPC OpenAI-Compatible Medical LLM', 'openai_compatible', 'custom-medical-coder', '', 45000, 4096, FALSE, FALSE, 'REQUIRES_BAA', 'UNCONFIGURED', 'Configure private VPC inference URL and credentials.')`,
           [createdOrgId],
         );
 
@@ -627,7 +636,9 @@ export function createApiRouter(): Router {
           `INSERT INTO integration_configs (organization_id, vendor_name, integration_type, endpoint_url, auth_method, connection_status, permissions_scope)
            VALUES
              ($1, 'X12 270/271 Clearinghouse Eligibility', 'CLEARINGHOUSE_X12', '', 'OAuth 2.0 Client Credentials + mTLS', 'CONFIGURATION_REQUIRED', 'eligibility.270 eligibility.271 claims.837'),
-             ($1, 'Epic Systems (SMART on FHIR R4)', 'EHR_FHIR_R4', '', 'OAuth 2.0 SMART Backend Services', 'CONFIGURATION_REQUIRED', 'patient/*.read encounter/*.read documentreference/*.read')`,
+             ($1, 'Epic Systems (SMART on FHIR R4)', 'EHR_FHIR_R4', '', 'OAuth 2.0 SMART Backend Services', 'CONFIGURATION_REQUIRED', 'patient/*.read encounter/*.read documentreference/*.read'),
+             ($1, 'Oracle Health / Cerner (FHIR R4)', 'EHR_FHIR_R4', '', 'OAuth 2.0 SMART Backend Services', 'CONFIGURATION_REQUIRED', 'patient/*.read encounter/*.read'),
+             ($1, 'athenahealth EHR & Practice API', 'EHR_FHIR_R4', '', 'OAuth 2.0 Client Credentials', 'CONFIGURATION_REQUIRED', 'patients encounters insurance')`,
           [createdOrgId],
         );
 
@@ -1116,7 +1127,10 @@ export function createApiRouter(): Router {
     try {
       const schema = z.object({
         name: z.string().min(2).max(140),
-        npi: z.string().regex(/^\d{10}$/),
+        organization_type: z
+          .enum(['hospital', 'physician_group', 'ambulatory_surgery_center', 'rcm_company', 'independent_coder'])
+          .optional(),
+        npi: z.string().regex(/^(\d{10}|SOLO-CODER|RCM-ORG)$/),
         tax_id: z.string().min(4).max(30),
         specialty: z.string().min(2).max(120),
         retention_days: z.number().int().min(365).max(3650),
@@ -1133,8 +1147,9 @@ export function createApiRouter(): Router {
         const upd = await client.query(
           `UPDATE organizations
            SET name = $1, npi = $2, tax_id = $3, specialty = $4, retention_days = $5, baa_attested = $6,
-               onboarding_completed = COALESCE($7, onboarding_completed)
-           WHERE id = $8
+               onboarding_completed = COALESCE($7, onboarding_completed),
+               organization_type = COALESCE($8, organization_type)
+           WHERE id = $9
            RETURNING *`,
           [
             parsed.data.name.trim(),
@@ -1144,6 +1159,7 @@ export function createApiRouter(): Router {
             parsed.data.retention_days,
             parsed.data.baa_attested,
             parsed.data.onboarding_completed ?? null,
+            parsed.data.organization_type ?? null,
             req.auth!.organizationId,
           ],
         );
@@ -1742,23 +1758,46 @@ export function createApiRouter(): Router {
         if (mimeType === 'text/plain' || mimeType === 'application/json' || mimeType === 'text/csv') {
           extractedText = req.file.buffer.toString('utf8');
         } else {
-          // PDF or Scanned Image -> invoke configured OCR engine
-          const activeModel = await withOrgTransaction(orgId, async (client) => {
-            const m = await client.query(`SELECT * FROM ai_model_configs WHERE organization_id = $1 AND is_active = TRUE LIMIT 1`, [orgId]);
-            return m.rows[0] as AIModelConfig | undefined;
+          // PDF or Scanned Image -> enforce organization BAA & model PHI governance before external OCR
+          const ocrGovernance = await withOrgTransaction(orgId, async (client) => {
+            const [mRes, oRes] = await Promise.all([
+              client.query(`SELECT * FROM ai_model_configs WHERE organization_id = $1 AND is_active = TRUE LIMIT 1`, [orgId]),
+              client.query(`SELECT synthetic_mode, baa_attested FROM organizations WHERE id = $1`, [orgId]),
+            ]);
+            return {
+              activeModel: mRes.rows[0] as AIModelConfig | undefined,
+              orgIsSynthetic: Boolean(oRes.rows[0]?.synthetic_mode),
+              orgBaaAttested: Boolean(oRes.rows[0]?.baa_attested),
+            };
           });
-          try {
-            extractedText = await performMultimodalOcrExtraction({
-              mimeType,
-              base64Data: req.file.buffer.toString('base64'),
-              fileName,
-              activeModelConfig: activeModel ?? null,
-            });
-          } catch (ocrErr) {
-            ocrStatus = 'FAILED';
-            ocrError = ocrErr instanceof Error ? ocrErr.message : 'OCR processing unavailable';
+
+          const modelApprovedForPhi =
+            ocrGovernance.activeModel?.approved_for_phi === 1 || ocrGovernance.activeModel?.approved_for_phi === true;
+
+          if (!ocrGovernance.orgIsSynthetic && (!ocrGovernance.orgBaaAttested || !modelApprovedForPhi)) {
+            ocrStatus = 'PENDING';
+            ocrError = !ocrGovernance.orgBaaAttested
+              ? 'BAA_ATTESTATION_REQUIRED: Organization HIPAA BAA attestation must be completed in Settings before transmitting PDF/image records to external OCR.'
+              : 'MODEL_NOT_APPROVED_FOR_PHI: Active AI/OCR provider is not marked approved for ePHI (BAA executed). Approve a BAA-executed model in AI Models before running external OCR.';
             if (!extractedText) {
-              extractedText = `[OCR PENDING / UNAVAILABLE: ${ocrError}]`;
+              extractedText = `[OCR HELD PENDING BAA COMPLIANCE: "${fileName}" was stored securely in your private organization bucket, but external OCR was blocked because ${
+                !ocrGovernance.orgBaaAttested ? 'organization BAA attestation is incomplete' : 'the active AI/OCR provider is not approved for ePHI'
+              }. Complete governance approval or paste redacted/de-identified clinical text directly.]`;
+            }
+          } else {
+            try {
+              extractedText = await performMultimodalOcrExtraction({
+                mimeType,
+                base64Data: req.file.buffer.toString('base64'),
+                fileName,
+                activeModelConfig: ocrGovernance.activeModel ?? null,
+              });
+            } catch (ocrErr) {
+              ocrStatus = 'FAILED';
+              ocrError = ocrErr instanceof Error ? ocrErr.message : 'OCR processing unavailable';
+              if (!extractedText) {
+                extractedText = `[OCR PENDING / UNAVAILABLE: ${ocrError}]`;
+              }
             }
           }
         }
@@ -2168,9 +2207,18 @@ export function createApiRouter(): Router {
         next(err);
         return;
       }
-      res.status(502).json({
+      const statusCode =
+        typeof err === 'object' && err !== null && 'statusCode' in err && typeof (err as { statusCode: unknown }).statusCode === 'number'
+          ? (err as { statusCode: number }).statusCode
+          : 502;
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code: unknown }).code === 'string'
+          ? (err as { code: string }).code
+          : undefined;
+      res.status(statusCode).json({
+        code,
         error: err instanceof Error ? err.message : 'AI coding inference failed.',
-        retryable: true,
+        retryable: statusCode >= 500,
       });
     }
   });
@@ -2887,7 +2935,7 @@ export function createApiRouter(): Router {
         return;
       }
 
-      const urlValidation = validateExternalInferenceUrl(clearinghouseUrl);
+      const urlValidation = await assertSafeExternalUrlWithDns(clearinghouseUrl);
       if (!urlValidation.valid) {
         res.status(400).json({ error: `Clearinghouse URL rejected: ${urlValidation.reason}` });
         return;
@@ -2906,6 +2954,7 @@ export function createApiRouter(): Router {
           member_id: policy.member_id,
           date_of_service: parsed.data.date_of_service,
         }),
+        redirect: 'error',
         signal: AbortSignal.timeout(15000),
       });
 
@@ -3302,12 +3351,30 @@ export function createApiRouter(): Router {
         return;
       }
 
+      let authUserId: string | null = null;
+      const supabaseAdmin = getSupabaseAdmin();
+      if (supabaseAdmin) {
+        const createdAuth = await supabaseAdmin.auth.admin.createUser({
+          email,
+          password: parsed.data.temporary_password,
+          email_confirm: true,
+          user_metadata: {
+            full_name: parsed.data.full_name.trim(),
+            credentials: parsed.data.credentials.trim(),
+          },
+        });
+        if (createdAuth.data?.user?.id) {
+          authUserId = createdAuth.data.user.id;
+        }
+      }
+
       const newUserId = await withOrgTransaction(req.auth!.organizationId, async (client) => {
         const ins = await client.query(
-          `INSERT INTO users (organization_id, email, password_hash, full_name, role, credentials, mfa_enabled, is_active)
-           VALUES ($1, $2, $3, $4, $5, $6, FALSE, TRUE)
+          `INSERT INTO users (auth_user_id, organization_id, email, password_hash, full_name, role, credentials, mfa_enabled, is_active)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, TRUE)
            RETURNING id`,
           [
+            authUserId,
             req.auth!.organizationId,
             email,
             hashPassword(parsed.data.temporary_password),
@@ -3403,14 +3470,202 @@ export function createApiRouter(): Router {
         ipAddress: req.ip,
       });
 
-      res.status(201).json({ invitation });
+      res.status(201).json({
+        invitation,
+        invitePath: `/accept-invitation?token=${rawToken}`,
+      });
     } catch (err) {
       next(err);
     }
   });
 
-  router.get('/admin/leads', requireAuth, requireRole('admin', 'coding_director'), async (_req, res, next) => {
+  router.post(
+    '/team/invitations/:id/revoke',
+    requireAuth,
+    requireRole('admin', 'coding_director'),
+    async (req, res, next) => {
+      try {
+        const idCheck = z.string().uuid().safeParse(req.params.id);
+        if (!idCheck.success) {
+          res.status(400).json({ error: 'Valid invitation UUID is required.' });
+          return;
+        }
+        const revoked = await withOrgTransaction(req.auth!.organizationId, async (client) => {
+          const upd = await client.query(
+            `UPDATE team_invitations
+             SET status = 'REVOKED'
+             WHERE id = $1 AND organization_id = $2 AND status = 'PENDING'
+             RETURNING id, email, status`,
+            [idCheck.data, req.auth!.organizationId],
+          );
+          return upd.rows[0];
+        });
+        if (!revoked) {
+          res.status(404).json({ error: 'Pending invitation not found.' });
+          return;
+        }
+        await writeAuditLog({
+          organizationId: req.auth!.organizationId,
+          userId: req.auth!.userId,
+          userEmail: req.auth!.email,
+          action: 'TEAM_INVITATION_REVOKED',
+          resourceType: 'team_invitation',
+          resourceId: String(revoked.id),
+          details: `Revoked team invitation for ${revoked.email}.`,
+          ipAddress: req.ip,
+        });
+        res.json({ invitation: revoked });
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
+
+  router.get('/auth/invitation/:token', rateLimit(30, 60_000), async (req, res, next) => {
     try {
+      const token = String(req.params.token ?? '').trim();
+      if (!/^[a-f0-9]{32,128}$/i.test(token)) {
+        res.status(400).json({ error: 'Invalid invitation token format.' });
+        return;
+      }
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const pool = getPgPool();
+      const invRes = await pool.query(
+        `SELECT ti.id, ti.email, ti.full_name, ti.role, ti.credentials, ti.status, ti.expires_at,
+                o.name as organization_name
+         FROM team_invitations ti
+         JOIN organizations o ON o.id = ti.organization_id
+         WHERE ti.token_hash = $1
+         LIMIT 1`,
+        [tokenHash],
+      );
+      const inv = invRes.rows[0];
+      if (!inv || inv.status !== 'PENDING' || new Date(inv.expires_at).getTime() <= Date.now()) {
+        res.status(404).json({ error: 'Invitation is invalid, already used, or expired.' });
+        return;
+      }
+      res.json({
+        invitation: {
+          email: inv.email,
+          full_name: inv.full_name,
+          role: inv.role,
+          credentials: inv.credentials,
+          organization_name: inv.organization_name,
+          expires_at: inv.expires_at,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.post('/auth/accept-invitation', rateLimit(15, 60_000), async (req, res, next) => {
+    try {
+      const schema = z.object({
+        token: z.string().regex(/^[a-f0-9]{32,128}$/i),
+        password: z.string().min(12, 'Password must be at least 12 characters.'),
+        full_name: z.string().min(2).max(120).optional(),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid invitation acceptance request.' });
+        return;
+      }
+
+      const tokenHash = crypto.createHash('sha256').update(parsed.data.token.trim()).digest('hex');
+      const result = await withTransaction(async (client) => {
+        const invRes = await client.query(
+          `SELECT * FROM team_invitations WHERE token_hash = $1 FOR UPDATE`,
+          [tokenHash],
+        );
+        const inv = invRes.rows[0];
+        if (!inv || inv.status !== 'PENDING' || new Date(inv.expires_at).getTime() <= Date.now()) {
+          throw Object.assign(new Error('Invitation is invalid, already accepted, or expired.'), { statusCode: 404 });
+        }
+
+        const email = String(inv.email).trim().toLowerCase();
+        const existingUser = await client.query('SELECT id FROM users WHERE LOWER(email) = $1', [email]);
+        if (existingUser.rows.length > 0) {
+          throw Object.assign(new Error('An account with this email address already exists.'), { statusCode: 409 });
+        }
+
+        let authUserId: string | null = null;
+        const supabaseAdmin = getSupabaseAdmin();
+        if (supabaseAdmin) {
+          const createdAuth = await supabaseAdmin.auth.admin.createUser({
+            email,
+            password: parsed.data.password,
+            email_confirm: true,
+            user_metadata: {
+              full_name: (parsed.data.full_name ?? inv.full_name).trim(),
+              credentials: inv.credentials ?? '',
+            },
+          });
+          if (createdAuth.data?.user?.id) {
+            authUserId = createdAuth.data.user.id;
+          }
+        }
+
+        const finalName = (parsed.data.full_name ?? inv.full_name).trim();
+        const userIns = await client.query(
+          `INSERT INTO users (auth_user_id, organization_id, email, password_hash, full_name, role, credentials, mfa_enabled, is_active)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, TRUE)
+           RETURNING id, organization_id, email, full_name, role, credentials, mfa_enabled, is_active, created_at`,
+          [
+            authUserId,
+            inv.organization_id,
+            email,
+            hashPassword(parsed.data.password),
+            finalName,
+            inv.role,
+            inv.credentials ?? '',
+          ],
+        );
+
+        await client.query(`UPDATE team_invitations SET status = 'ACCEPTED' WHERE id = $1`, [inv.id]);
+        return { user: userIns.rows[0], invitationId: inv.id as string };
+      });
+
+      const session = await createPersistedSession({
+        userId: result.user.id,
+        organizationId: result.user.organization_id,
+        email: result.user.email,
+        role: result.user.role as UserRole,
+        mfaVerified: false,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+
+      await writeAuditLog({
+        organizationId: result.user.organization_id,
+        userId: result.user.id,
+        userEmail: result.user.email,
+        action: 'TEAM_INVITATION_ACCEPTED',
+        resourceType: 'team_invitation',
+        resourceId: result.invitationId,
+        details: `Accepted invitation and activated user ${result.user.email} (${result.user.role}).`,
+        ipAddress: req.ip,
+      });
+
+      res.status(201).json({
+        token: session.token,
+        expiresAt: session.expiresAt,
+        user: result.user,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.get('/admin/leads', requireAuth, requireRole('admin', 'coding_director'), async (req, res, next) => {
+    try {
+      if (!isPlatformAdminEmail(req.auth!.email)) {
+        res.status(403).json({
+          code: 'PLATFORM_ADMIN_REQUIRED',
+          error: 'Enterprise marketing leads are restricted to authorized MEDIIFY platform administrators (PLATFORM_ADMIN_EMAILS).',
+        });
+        return;
+      }
       const pool = getPgPool();
       const [leadsRes, newsRes] = await Promise.all([
         pool.query(`SELECT * FROM marketing_leads ORDER BY created_at DESC LIMIT 100`),
@@ -3427,6 +3682,18 @@ export function createApiRouter(): Router {
 
   router.patch('/admin/leads/:id', requireAuth, requireRole('admin', 'coding_director'), async (req, res, next) => {
     try {
+      if (!isPlatformAdminEmail(req.auth!.email)) {
+        res.status(403).json({
+          code: 'PLATFORM_ADMIN_REQUIRED',
+          error: 'Enterprise marketing leads are restricted to authorized MEDIIFY platform administrators (PLATFORM_ADMIN_EMAILS).',
+        });
+        return;
+      }
+      const idCheck = z.string().uuid().safeParse(req.params.id);
+      if (!idCheck.success) {
+        res.status(400).json({ error: 'Valid lead UUID is required.' });
+        return;
+      }
       const schema = z.object({
         status: z.enum(['NEW', 'QUALIFIED', 'CONTACTED', 'ARCHIVED']),
       });
@@ -3438,12 +3705,22 @@ export function createApiRouter(): Router {
       const pool = getPgPool();
       const upd = await pool.query(
         `UPDATE marketing_leads SET status = $1 WHERE id = $2 RETURNING id, status`,
-        [parsed.data.status, req.params.id],
+        [parsed.data.status, idCheck.data],
       );
       if (upd.rows.length === 0) {
         res.status(404).json({ error: 'Lead record not found' });
         return;
       }
+      await writeAuditLog({
+        organizationId: req.auth!.organizationId,
+        userId: req.auth!.userId,
+        userEmail: req.auth!.email,
+        action: 'PLATFORM_LEAD_STATUS_UPDATED',
+        resourceType: 'marketing_lead',
+        resourceId: idCheck.data,
+        details: `Updated marketing lead status to ${parsed.data.status}.`,
+        ipAddress: req.ip,
+      });
       res.json(upd.rows[0]);
     } catch (err) {
       next(err);
@@ -3650,7 +3927,7 @@ export function createApiRouter(): Router {
           return;
         }
 
-        const urlCheck = validateExternalInferenceUrl(urlToTest);
+        const urlCheck = await assertSafeExternalUrlWithDns(urlToTest);
         if (!urlCheck.valid) {
           await withOrgTransaction(orgId, async (client) => {
             await client.query(
@@ -3663,7 +3940,7 @@ export function createApiRouter(): Router {
         }
 
         try {
-          const resp = await fetch(urlToTest, { method: 'GET', signal: AbortSignal.timeout(5000) });
+          const resp = await fetch(urlToTest, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(5000) });
           if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
           const now = new Date().toISOString();
           await withOrgTransaction(orgId, async (client) => {
@@ -3798,6 +4075,47 @@ export function createApiRouter(): Router {
       });
 
       res.json(results);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- AUTHENTICATED MONITORING & READINESS STATUS (NO SECRETS OR PHI) ---
+  router.get('/monitoring/status', requireAuth, async (req, res, next) => {
+    try {
+      const orgId = req.auth!.organizationId;
+      const startedAt = Date.now();
+      const configReport = validateServerConfiguration();
+      const orgMetrics = await withOrgTransaction(orgId, async (client) => {
+        const [jobStats, modelStats] = await Promise.all([
+          client.query(
+            `SELECT COUNT(*)::int as total_24h,
+                    COUNT(*) FILTER (WHERE status = 'FAILED')::int as failed_24h,
+                    COALESCE(AVG(latency_ms), 0)::int as avg_latency_ms
+             FROM ai_processing_jobs
+             WHERE organization_id = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
+            [orgId],
+          ),
+          client.query(
+            `SELECT display_name, provider_type, is_active, approved_for_phi, baa_status, last_health_status, error_count, latency_ms
+             FROM ai_model_configs WHERE organization_id = $1 ORDER BY is_active DESC, display_name ASC`,
+            [orgId],
+          ),
+        ]);
+        return {
+          jobs24h: jobStats.rows[0],
+          models: modelStats.rows,
+        };
+      });
+
+      res.json({
+        status: 'operational',
+        dbProbeLatencyMs: Date.now() - startedAt,
+        configuration: configReport,
+        platformAdmin: isPlatformAdminEmail(req.auth!.email),
+        aiTelemetry: orgMetrics,
+        timestamp: new Date().toISOString(),
+      });
     } catch (err) {
       next(err);
     }

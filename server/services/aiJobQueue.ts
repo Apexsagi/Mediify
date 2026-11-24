@@ -218,15 +218,25 @@ export async function runAiExtractionJob(params: {
     const encounter = encRes.rows[0] as Encounter | undefined;
     if (!encounter) throw new Error('Encounter not found.');
 
-    const orgRes = await client.query(`SELECT synthetic_mode FROM organizations WHERE id = $1`, [organizationId]);
+    const orgRes = await client.query(`SELECT synthetic_mode, baa_attested FROM organizations WHERE id = $1`, [organizationId]);
     const orgIsSynthetic = Boolean(orgRes.rows[0]?.synthetic_mode);
+    const orgBaaAttested = Boolean(orgRes.rows[0]?.baa_attested);
+
+    if (!orgIsSynthetic && !orgBaaAttested) {
+      throw Object.assign(
+        new Error(
+          'Compliance Guardrail: Organization HIPAA Business Associate Agreement (BAA) attestation is required before transmitting patient ePHI to AI extraction providers. Attest your BAA in Organization Settings or enable Synthetic Mode.',
+        ),
+        { statusCode: 412, code: 'BAA_ATTESTATION_REQUIRED' },
+      );
+    }
 
     const recRes = await client.query(
       `SELECT id, file_name, raw_text FROM medical_records WHERE encounter_id = $1 AND organization_id = $2 ORDER BY created_at DESC LIMIT 1`,
       [encounterId, organizationId],
     );
     const record = recRes.rows[0] as { id: string; file_name: string; raw_text: string } | undefined;
-    if (!record) throw new Error('No clinical document attached to this encounter.');
+    if (!record) throw Object.assign(new Error('No clinical document attached to this encounter.'), { statusCode: 404 });
 
     const modelRes = modelConfigId
       ? await client.query(`SELECT * FROM ai_model_configs WHERE id = $1 AND organization_id = $2`, [
@@ -237,7 +247,21 @@ export async function runAiExtractionJob(params: {
           organizationId,
         ]);
     const modelConfig = modelRes.rows[0] as AIModelConfig | undefined;
-    if (!modelConfig) throw new Error('No active AI model configuration found. Configure one in AI Models.');
+    if (!modelConfig) {
+      throw Object.assign(new Error('No active AI model configuration found. Configure one in AI Models.'), {
+        statusCode: 400,
+      });
+    }
+
+    const modelApprovedForPhi = modelConfig.approved_for_phi === 1 || modelConfig.approved_for_phi === true;
+    if (!orgIsSynthetic && !modelApprovedForPhi) {
+      throw Object.assign(
+        new Error(
+          `Compliance Guardrail: Provider "${modelConfig.display_name}" is not approved for real ePHI (BAA status: ${modelConfig.baa_status}). Enable a BAA-executed endpoint in AI Models before processing patient records.`,
+        ),
+        { statusCode: 412, code: 'MODEL_NOT_APPROVED_FOR_PHI' },
+      );
+    }
 
     const catalog = await loadReferenceCatalogPg(client);
 

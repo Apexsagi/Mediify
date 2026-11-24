@@ -1,3 +1,5 @@
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { GoogleGenAI, Type } from '@google/genai';
 import { z } from 'zod';
 import {
@@ -58,29 +60,120 @@ const extractionPayloadSchema = z.object({
   ),
 });
 
+function isPrivateOrReservedIpv4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
+  const [a, b] = parts;
+  if (a === 0) return true; // 0.0.0.0/8
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a === 127) return true; // 127.0.0.0/8 loopback
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local / cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 0 && parts[2] === 0) return true; // 192.0.0.0/24
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmark
+  if (a >= 224) return true; // Multicast & reserved
+  return false;
+}
+
+export function isPrivateOrReservedIp(rawIp: string): boolean {
+  const normalized = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!normalized) return true;
+  if (net.isIPv4(normalized)) {
+    return isPrivateOrReservedIpv4(normalized);
+  }
+  if (net.isIPv6(normalized)) {
+    const bare = normalized.split('%')[0];
+    if (bare === '::' || bare === '::1') return true;
+    if (bare.startsWith('::ffff:')) {
+      const mapped = bare.slice('::ffff:'.length);
+      if (net.isIPv4(mapped)) return isPrivateOrReservedIpv4(mapped);
+      // Hex form e.g. ::ffff:7f00:1
+      const hexParts = mapped.split(':');
+      if (hexParts.length === 2) {
+        const hi = Number.parseInt(hexParts[0], 16);
+        const lo = Number.parseInt(hexParts[1], 16);
+        if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+          const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+          return isPrivateOrReservedIpv4(ipv4);
+        }
+      }
+      return true;
+    }
+    if (bare.startsWith('fc') || bare.startsWith('fd')) return true; // fc00::/7 ULA
+    if (/^fe[89ab]/.test(bare)) return true; // fe80::/10 link-local
+    if (bare.startsWith('ff')) return true; // Multicast
+    return false;
+  }
+  return true;
+}
+
 export function validateExternalInferenceUrl(rawUrl: string): { valid: boolean; reason?: string } {
-  if (!rawUrl) return { valid: false, reason: 'Endpoint URL is not configured.' };
+  if (!rawUrl || !rawUrl.trim()) return { valid: false, reason: 'Endpoint URL is not configured.' };
   let parsed: URL;
   try {
-    parsed = new URL(rawUrl);
+    parsed = new URL(rawUrl.trim());
   } catch {
     return { valid: false, reason: 'Invalid URL format.' };
+  }
+  if (parsed.username || parsed.password) {
+    return { valid: false, reason: 'Credentials inside endpoint URL are prohibited.' };
+  }
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd && parsed.protocol !== 'https:') {
+    return { valid: false, reason: 'HTTPS is required for external endpoints in production.' };
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     return { valid: false, reason: 'Only http/https endpoints are supported.' };
   }
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) {
+    return { valid: false, reason: 'Invalid hostname in endpoint URL.' };
+  }
   if (
     host === 'localhost' ||
-    host === '127.0.0.1' ||
-    host === '::1' ||
-    host.startsWith('169.254.') ||
-    host.startsWith('10.') ||
-    host.startsWith('192.168.')
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.arpa') ||
+    host === 'metadata.google.internal' ||
+    /^0x[0-9a-f]+$/i.test(host) ||
+    /^\d+$/.test(host)
   ) {
-    return { valid: false, reason: 'Blocked loopback/private/metadata host for SSRF protection.' };
+    return { valid: false, reason: 'Blocked loopback/private/internal host for SSRF protection.' };
+  }
+  if (net.isIP(host) && isPrivateOrReservedIp(host)) {
+    return { valid: false, reason: 'Blocked private or reserved IP address for SSRF protection.' };
   }
   return { valid: true };
+}
+
+export async function assertSafeExternalUrlWithDns(rawUrl: string): Promise<{ valid: boolean; reason?: string }> {
+  const staticCheck = validateExternalInferenceUrl(rawUrl);
+  if (!staticCheck.valid) return staticCheck;
+
+  const host = new URL(rawUrl.trim()).hostname.replace(/^\[|\]$/g, '');
+  if (net.isIP(host)) {
+    return isPrivateOrReservedIp(host)
+      ? { valid: false, reason: 'Blocked private or reserved IP address for SSRF protection.' }
+      : { valid: true };
+  }
+
+  try {
+    const records = await dns.lookup(host, { all: true, verbatim: true });
+    if (records.length === 0) {
+      return { valid: false, reason: 'Endpoint hostname did not resolve to any IP address.' };
+    }
+    for (const rec of records) {
+      if (isPrivateOrReservedIp(rec.address)) {
+        return { valid: false, reason: 'Endpoint DNS resolved to a private or reserved IP address (SSRF blocked).' };
+      }
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: 'Unable to resolve external endpoint hostname safely.' };
+  }
 }
 
 function resolveProviderCredential(providerType: AIModelConfig['provider_type']): string | undefined {
@@ -150,7 +243,7 @@ export async function checkAiProviderHealth(modelConfig: AIModelConfig): Promise
     }
   }
 
-  const urlCheck = validateExternalInferenceUrl(modelConfig.api_url);
+  const urlCheck = await assertSafeExternalUrlWithDns(modelConfig.api_url);
   if (!urlCheck.valid) {
     return {
       status: modelConfig.api_url ? 'UNREACHABLE' : 'UNCONFIGURED',
@@ -171,6 +264,7 @@ export async function checkAiProviderHealth(modelConfig: AIModelConfig): Promise
         max_tokens: 1,
         messages: [{ role: 'user', content: 'ping' }],
       }),
+      redirect: 'error',
       signal: AbortSignal.timeout(Math.min(modelConfig.timeout_ms || 10000, 10000)),
     });
     const latencyMs = Date.now() - startedAt;
@@ -304,7 +398,7 @@ export async function runClinicalExtractionAndCoding(params: {
     rawJsonText = (response.text ?? '{}').trim();
   } else {
     // inclusionAI/LingSante-3.1-air-VL, HuggingFace Inference, or OpenAI-Compatible Server-Side Endpoint
-    const urlCheck = validateExternalInferenceUrl(modelConfig.api_url);
+    const urlCheck = await assertSafeExternalUrlWithDns(modelConfig.api_url);
     if (!urlCheck.valid) {
       throw new Error(`${modelConfig.display_name} endpoint invalid: ${urlCheck.reason}`);
     }
@@ -346,6 +440,7 @@ export async function runClinicalExtractionAndCoding(params: {
             { role: 'user', content: userContent },
           ],
         }),
+        redirect: 'error',
         signal: controller.signal,
       });
 
@@ -405,7 +500,7 @@ export async function performMultimodalOcrExtraction(params: {
   // Use active LingSante VLM if configured and approved, otherwise Gemini if configured. Never silent-switch unapproved models.
   const cfg = params.activeModelConfig;
   if (cfg && cfg.provider_type === 'lingsante' && cfg.api_url && process.env.LINGSANTE_API_KEY && params.mimeType.startsWith('image/')) {
-    const urlCheck = validateExternalInferenceUrl(cfg.api_url);
+    const urlCheck = await assertSafeExternalUrlWithDns(cfg.api_url);
     if (!urlCheck.valid) throw new Error(urlCheck.reason);
 
     const resp = await fetch(cfg.api_url, {
@@ -430,6 +525,7 @@ export async function performMultimodalOcrExtraction(params: {
           },
         ],
       }),
+      redirect: 'error',
       signal: AbortSignal.timeout(cfg.timeout_ms || 30000),
     });
     if (!resp.ok) {
