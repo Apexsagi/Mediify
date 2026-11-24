@@ -15,7 +15,8 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/server ./server
 COPY --from=builder /app/src/lib ./src/lib
-RUN mkdir -p /app/data/uploads && chown -R node:node /app
+COPY --from=builder /app/supabase ./supabase
+RUN chown -R node:node /app
 USER node
 EXPOSE 3000
 CMD ["npx", "tsx", "server.ts"]

@@ -1,40 +1,152 @@
-import { useEffect, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import { AppShell, type AppPageId } from './components/AppShell';
 import { AuthPages } from './components/AuthPages';
-import {
-  AIModelSettingsView,
-  AuditLogsView,
-  IntegrationManagementView,
-  OrganizationSettingsView,
-  SecurityComplianceView,
-  TeamManagementView,
-} from './components/AdminGovernanceViews';
-import { MedicalRecordsView, PatientManagementView } from './components/ClinicalDataViews';
-import { CodingWorkspaceView } from './components/CodingWorkspaceView';
-import { DashboardView } from './components/DashboardView';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { LandingPage } from './components/LandingPage';
-import {
-  ClaimReadinessView,
-  CodingAuditView,
-  DenialPreventionView,
-  InsuranceVerificationView,
-  ReportsAnalyticsView,
-  RevenueIntegrityView,
-} from './components/RcmViews';
-import { CodeExplorerView, MedicalNecessityView } from './components/ReferenceLibraryViews';
 import { apiRequest, setSessionToken } from './lib/api';
 import type { Organization, UserProfile } from './lib/types';
 
+// Route-based lazy loading for bundle efficiency
+const DashboardView = lazy(() => import('./components/DashboardView').then((m) => ({ default: m.DashboardView })));
+const MyWorklistView = lazy(() => import('./components/OperationsViews').then((m) => ({ default: m.MyWorklistView })));
+const NotificationsView = lazy(() =>
+  import('./components/OperationsViews').then((m) => ({ default: m.NotificationsView })),
+);
+const EncountersView = lazy(() => import('./components/OperationsViews').then((m) => ({ default: m.EncountersView })));
+const QualityAssuranceView = lazy(() =>
+  import('./components/OperationsViews').then((m) => ({ default: m.QualityAssuranceView })),
+);
+const PatientManagementView = lazy(() =>
+  import('./components/ClinicalDataViews').then((m) => ({ default: m.PatientManagementView })),
+);
+const MedicalRecordsView = lazy(() =>
+  import('./components/ClinicalDataViews').then((m) => ({ default: m.MedicalRecordsView })),
+);
+const CodingWorkspaceView = lazy(() =>
+  import('./components/CodingWorkspaceView').then((m) => ({ default: m.CodingWorkspaceView })),
+);
+const CodeExplorerView = lazy(() =>
+  import('./components/ReferenceLibraryViews').then((m) => ({ default: m.CodeExplorerView })),
+);
+const MedicalNecessityView = lazy(() =>
+  import('./components/ReferenceLibraryViews').then((m) => ({ default: m.MedicalNecessityView })),
+);
+const InsuranceVerificationView = lazy(() =>
+  import('./components/RcmViews').then((m) => ({ default: m.InsuranceVerificationView })),
+);
+const DenialPreventionView = lazy(() =>
+  import('./components/RcmViews').then((m) => ({ default: m.DenialPreventionView })),
+);
+const RevenueIntegrityView = lazy(() =>
+  import('./components/RcmViews').then((m) => ({ default: m.RevenueIntegrityView })),
+);
+const CodingAuditView = lazy(() => import('./components/RcmViews').then((m) => ({ default: m.CodingAuditView })));
+const ClaimReadinessView = lazy(() =>
+  import('./components/RcmViews').then((m) => ({ default: m.ClaimReadinessView })),
+);
+const ReportsAnalyticsView = lazy(() =>
+  import('./components/RcmViews').then((m) => ({ default: m.ReportsAnalyticsView })),
+);
+const OrganizationSettingsView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.OrganizationSettingsView })),
+);
+const TeamManagementView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.TeamManagementView })),
+);
+const AIModelSettingsView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.AIModelSettingsView })),
+);
+const IntegrationManagementView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.IntegrationManagementView })),
+);
+const SecurityComplianceView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.SecurityComplianceView })),
+);
+const AuditLogsView = lazy(() =>
+  import('./components/AdminGovernanceViews').then((m) => ({ default: m.AuditLogsView })),
+);
+
 type RootScreen = 'landing' | 'auth' | 'workspace';
 
+const VALID_PAGES = new Set<AppPageId>([
+  'dashboard',
+  'worklist',
+  'notifications',
+  'patients',
+  'records',
+  'encounters',
+  'coding-workspace',
+  'icd10',
+  'cpt',
+  'hcpcs',
+  'modifiers',
+  'medical-necessity',
+  'insurance',
+  'denials',
+  'revenue-integrity',
+  'claims',
+  'audits',
+  'quality-assurance',
+  'reports',
+  'onboarding',
+  'team',
+  'ai-models',
+  'integrations',
+  'security',
+  'audit-logs',
+  'settings',
+]);
+
+function parseUrlRoute(): { screen: RootScreen; authMode: 'login' | 'register'; page: AppPageId; encounterId: string | null } {
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+  if (!path) return { screen: 'landing', authMode: 'login', page: 'dashboard', encounterId: null };
+  if (path === 'login') return { screen: 'auth', authMode: 'login', page: 'dashboard', encounterId: null };
+  if (path === 'register') return { screen: 'auth', authMode: 'register', page: 'dashboard', encounterId: null };
+
+  const [seg1, seg2] = path.split('/');
+  if (VALID_PAGES.has(seg1 as AppPageId)) {
+    return {
+      screen: 'workspace',
+      authMode: 'login',
+      page: seg1 as AppPageId,
+      encounterId: seg2 || null,
+    };
+  }
+  return { screen: 'landing', authMode: 'login', page: 'dashboard', encounterId: null };
+}
+
 export default function App() {
-  const [screen, setScreen] = useState<RootScreen>('landing');
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
-  const [activePage, setActivePage] = useState<AppPageId>('dashboard');
-  const [selectedEncounterId, setSelectedEncounterId] = useState<string | null>(null);
+  const initial = parseUrlRoute();
+  const [screen, setScreen] = useState<RootScreen>(initial.screen === 'workspace' ? 'auth' : initial.screen);
+  const [authMode, setAuthMode] = useState<'login' | 'register'>(initial.authMode);
+  const [activePage, setActivePage] = useState<AppPageId>(initial.page);
+  const [selectedEncounterId, setSelectedEncounterId] = useState<string | null>(initial.encounterId);
   const [user, setUser] = useState<UserProfile | null>(null);
   const [organization, setOrganization] = useState<Organization | null>(null);
-  const [sandboxLoading, setSandboxLoading] = useState(false);
+
+  const syncHistory = useCallback((nextPath: string) => {
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+  }, []);
+
+  useEffect(() => {
+    function onPopState() {
+      const parsed = parseUrlRoute();
+      if (parsed.screen === 'landing') {
+        setScreen('landing');
+      } else if (parsed.screen === 'auth' || !user) {
+        setAuthMode(parsed.authMode);
+        setScreen('auth');
+      } else {
+        setActivePage(parsed.page);
+        if (parsed.encounterId) setSelectedEncounterId(parsed.encounterId);
+        setScreen('workspace');
+      }
+    }
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [user]);
 
   async function refreshSessionContext() {
     const me = await apiRequest<{ user: UserProfile; organization: Organization }>('/auth/me');
@@ -42,51 +154,39 @@ export default function App() {
     setOrganization(me.organization);
   }
 
-  async function handleLaunchSandbox() {
-    setSandboxLoading(true);
-    try {
-      const res = await apiRequest<{ token: string; user: UserProfile }>('/auth/demo-sandbox', {
-        method: 'POST',
-      });
-      setSessionToken(res.token);
-      setUser(res.user);
-      await refreshSessionContext();
-      setActivePage('dashboard');
-      setScreen('workspace');
-    } finally {
-      setSandboxLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('autostart') === '1') {
-      void handleLaunchSandbox();
-    }
-  }, []);
-
   async function handleAuthenticated(loggedInUser: UserProfile, isNewOrg: boolean) {
     setUser(loggedInUser);
     await refreshSessionContext();
-    setActivePage(isNewOrg ? 'onboarding' : 'dashboard');
+    const targetPage: AppPageId = isNewOrg ? 'onboarding' : activePage || 'dashboard';
+    setActivePage(targetPage);
     setScreen('workspace');
+    syncHistory(targetPage === 'coding-workspace' && selectedEncounterId ? `/coding-workspace/${selectedEncounterId}` : `/${targetPage}`);
   }
 
-  function handleSignOut() {
+  async function handleSignOut() {
+    try {
+      await apiRequest('/auth/logout', { method: 'POST' });
+    } catch {
+      // Ignore network errors during logout cleanup
+    }
     setSessionToken(null);
     setUser(null);
     setOrganization(null);
     setScreen('landing');
+    syncHistory('/');
   }
 
   function handleNavigate(page: AppPageId, encounterId?: string) {
     if (encounterId) setSelectedEncounterId(encounterId);
     setActivePage(page);
+    const enc = encounterId ?? (page === 'coding-workspace' ? selectedEncounterId : null);
+    syncHistory(page === 'coding-workspace' && enc ? `/coding-workspace/${enc}` : `/${page}`);
   }
 
   function handleOpenEncounter(encounterId: string) {
     setSelectedEncounterId(encounterId);
     setActivePage('coding-workspace');
+    syncHistory(`/coding-workspace/${encounterId}`);
   }
 
   if (screen === 'landing') {
@@ -95,9 +195,8 @@ export default function App() {
         onOpenAuth={(mode) => {
           setAuthMode(mode);
           setScreen('auth');
+          syncHistory(mode === 'register' ? '/register' : '/login');
         }}
-        onLaunchSandbox={() => void handleLaunchSandbox()}
-        sandboxLoading={sandboxLoading}
       />
     );
   }
@@ -106,10 +205,11 @@ export default function App() {
     return (
       <AuthPages
         initialMode={authMode}
-        onBackToLanding={() => setScreen('landing')}
+        onBackToLanding={() => {
+          setScreen('landing');
+          syncHistory('/');
+        }}
         onAuthenticated={(u, isNew) => void handleAuthenticated(u, isNew)}
-        onLaunchSandbox={() => void handleLaunchSandbox()}
-        sandboxLoading={sandboxLoading}
       />
     );
   }
@@ -120,48 +220,63 @@ export default function App() {
       onNavigate={handleNavigate}
       user={user}
       organization={organization}
-      onSignOut={handleSignOut}
+      onSignOut={() => void handleSignOut()}
     >
-      {activePage === 'dashboard' && (
-        <DashboardView onOpenEncounter={handleOpenEncounter} onNavigate={handleNavigate} />
-      )}
-      {activePage === 'onboarding' && (
-        <OrganizationSettingsView
-          organization={organization}
-          onUpdated={() => void refreshSessionContext()}
-          isOnboarding
-        />
-      )}
-      {activePage === 'patients' && <PatientManagementView />}
-      {activePage === 'records' && <MedicalRecordsView onOpenEncounter={handleOpenEncounter} />}
-      {activePage === 'coding-workspace' && (
-        <CodingWorkspaceView
-          encounterId={selectedEncounterId}
-          onSelectEncounter={(id) => setSelectedEncounterId(id)}
-        />
-      )}
-      {activePage === 'icd10' && <CodeExplorerView systemFilter="ICD-10" />}
-      {activePage === 'cpt' && <CodeExplorerView systemFilter="CPT" />}
-      {activePage === 'hcpcs' && <CodeExplorerView systemFilter="HCPCS" />}
-      {activePage === 'modifiers' && <CodeExplorerView systemFilter="MODIFIER" />}
-      {activePage === 'medical-necessity' && <MedicalNecessityView />}
-      {activePage === 'insurance' && <InsuranceVerificationView />}
-      {activePage === 'denials' && <DenialPreventionView onOpenEncounter={handleOpenEncounter} />}
-      {activePage === 'revenue-integrity' && <RevenueIntegrityView onOpenEncounter={handleOpenEncounter} />}
-      {activePage === 'audits' && <CodingAuditView onOpenEncounter={handleOpenEncounter} />}
-      {activePage === 'claims' && <ClaimReadinessView onOpenEncounter={handleOpenEncounter} />}
-      {activePage === 'reports' && <ReportsAnalyticsView />}
-      {activePage === 'team' && <TeamManagementView />}
-      {activePage === 'ai-models' && <AIModelSettingsView />}
-      {activePage === 'integrations' && <IntegrationManagementView />}
-      {activePage === 'security' && <SecurityComplianceView />}
-      {activePage === 'audit-logs' && <AuditLogsView />}
-      {activePage === 'settings' && (
-        <OrganizationSettingsView
-          organization={organization}
-          onUpdated={() => void refreshSessionContext()}
-        />
-      )}
+      <ErrorBoundary>
+        <Suspense fallback={<div className="h-72 bg-white border border-[#E2E8F0] rounded-lg animate-pulse" />}>
+          {activePage === 'dashboard' && (
+            <DashboardView onOpenEncounter={handleOpenEncounter} onNavigate={handleNavigate} />
+          )}
+          {activePage === 'worklist' && (
+            <MyWorklistView onOpenEncounter={handleOpenEncounter} onNavigate={handleNavigate} />
+          )}
+          {activePage === 'notifications' && <NotificationsView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'patients' && <PatientManagementView />}
+          {activePage === 'records' && <MedicalRecordsView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'encounters' && (
+            <EncountersView onOpenEncounter={handleOpenEncounter} onNavigate={handleNavigate} />
+          )}
+          {activePage === 'coding-workspace' && (
+            <CodingWorkspaceView
+              encounterId={selectedEncounterId}
+              onSelectEncounter={(id) => {
+                setSelectedEncounterId(id);
+                syncHistory(`/coding-workspace/${id}`);
+              }}
+            />
+          )}
+          {activePage === 'icd10' && <CodeExplorerView systemFilter="ICD-10" />}
+          {activePage === 'cpt' && <CodeExplorerView systemFilter="CPT" />}
+          {activePage === 'hcpcs' && <CodeExplorerView systemFilter="HCPCS" />}
+          {activePage === 'modifiers' && <CodeExplorerView systemFilter="MODIFIER" />}
+          {activePage === 'medical-necessity' && <MedicalNecessityView />}
+          {activePage === 'insurance' && <InsuranceVerificationView />}
+          {activePage === 'denials' && <DenialPreventionView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'revenue-integrity' && <RevenueIntegrityView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'claims' && <ClaimReadinessView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'audits' && <CodingAuditView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'quality-assurance' && <QualityAssuranceView onOpenEncounter={handleOpenEncounter} />}
+          {activePage === 'reports' && <ReportsAnalyticsView />}
+          {activePage === 'onboarding' && (
+            <OrganizationSettingsView
+              organization={organization}
+              onUpdated={() => void refreshSessionContext()}
+              isOnboarding
+            />
+          )}
+          {activePage === 'team' && <TeamManagementView />}
+          {activePage === 'ai-models' && <AIModelSettingsView />}
+          {activePage === 'integrations' && <IntegrationManagementView />}
+          {activePage === 'security' && <SecurityComplianceView />}
+          {activePage === 'audit-logs' && <AuditLogsView />}
+          {activePage === 'settings' && (
+            <OrganizationSettingsView
+              organization={organization}
+              onUpdated={() => void refreshSessionContext()}
+            />
+          )}
+        </Suspense>
+      </ErrorBoundary>
     </AppShell>
   );
 }

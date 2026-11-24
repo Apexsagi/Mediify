@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import type { NextFunction, Request, Response } from 'express';
-import { db } from './db';
+import { getPgPool, getSupabaseAdmin } from './supabase';
 import type { UserRole } from '../src/lib/types';
 
 const RUNTIME_SESSION_SECRET =
@@ -8,13 +8,17 @@ const RUNTIME_SESSION_SECRET =
     ? process.env.SESSION_SECRET
     : crypto.randomBytes(32).toString('hex');
 
+const DEFAULT_SESSION_TTL_MINUTES = Math.max(5, Math.min(120, Number(process.env.SESSION_TTL_MINUTES || 30)));
+
 export interface AuthenticatedContext {
   userId: string;
+  authUserId: string | null;
   organizationId: string;
   email: string;
   fullName: string;
   role: UserRole;
   mfaVerified: boolean;
+  sessionJti: string | null;
 }
 
 declare global {
@@ -31,7 +35,8 @@ export function hashPassword(password: string): string {
   return `${salt}:${derived}`;
 }
 
-export function verifyPassword(password: string, storedHash: string): boolean {
+export function verifyPassword(password: string, storedHash: string | null | undefined): boolean {
+  if (!storedHash) return false;
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
   const [salt, expectedHex] = parts;
@@ -42,6 +47,7 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 interface SessionPayload {
+  jti: string;
   uid: string;
   oid: string;
   email: string;
@@ -50,17 +56,31 @@ interface SessionPayload {
   exp: number;
 }
 
-export function signSessionToken(payload: Omit<SessionPayload, 'exp'>, ttlHours = 12): string {
+export function signSessionToken(
+  payload: Omit<SessionPayload, 'exp' | 'jti'> & { jti?: string },
+  ttlMinutes = DEFAULT_SESSION_TTL_MINUTES,
+): { token: string; jti: string; expiresAt: string } {
+  const jti = payload.jti ?? crypto.randomUUID();
+  const exp = Date.now() + ttlMinutes * 60 * 1000;
   const fullPayload: SessionPayload = {
-    ...payload,
-    exp: Date.now() + ttlHours * 3600 * 1000,
+    jti,
+    uid: payload.uid,
+    oid: payload.oid,
+    email: payload.email,
+    role: payload.role,
+    mfa: payload.mfa,
+    exp,
   };
   const encoded = Buffer.from(JSON.stringify(fullPayload), 'utf8').toString('base64url');
   const sig = crypto
     .createHmac('sha256', RUNTIME_SESSION_SECRET)
     .update(encoded)
     .digest('base64url');
-  return `${encoded}.${sig}`;
+  return {
+    token: `${encoded}.${sig}`,
+    jti,
+    expiresAt: new Date(exp).toISOString(),
+  };
 }
 
 export function verifySessionToken(token: string): SessionPayload | null {
@@ -78,37 +98,57 @@ export function verifySessionToken(token: string): SessionPayload | null {
   }
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionPayload;
-    if (!parsed.exp || Date.now() > parsed.exp) return null;
+    if (!parsed.exp || Date.now() > parsed.exp || !parsed.jti) return null;
     return parsed;
   } catch {
     return null;
   }
 }
 
-export function generateTotpCode(secretBase32: string, stepOffset = 0): string {
-  const counter = Math.floor(Date.now() / 30000) + stepOffset;
-  const buf = Buffer.alloc(8);
-  buf.writeBigUInt64BE(BigInt(counter));
-  const hmac = crypto.createHmac('sha1', Buffer.from(secretBase32, 'hex')).update(buf).digest();
-  const offset = hmac[hmac.length - 1] & 0x0f;
-  const code =
-    ((hmac[offset] & 0x7f) << 24) |
-    ((hmac[offset + 1] & 0xff) << 16) |
-    ((hmac[offset + 2] & 0xff) << 8) |
-    (hmac[offset + 3] & 0xff);
-  return String(code % 1_000_000).padStart(6, '0');
+export async function createPersistedSession(params: {
+  userId: string;
+  organizationId: string;
+  email: string;
+  role: UserRole;
+  mfaVerified: boolean;
+  ipAddress?: string;
+  userAgent?: string;
+}): Promise<{ token: string; expiresAt: string; jti: string }> {
+  const signed = signSessionToken({
+    uid: params.userId,
+    oid: params.organizationId,
+    email: params.email,
+    role: params.role,
+    mfa: params.mfaVerified,
+  });
+
+  const pool = getPgPool();
+  await pool.query(
+    `INSERT INTO user_sessions (user_id, organization_id, token_jti, ip_address, user_agent, mfa_verified, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      params.userId,
+      params.organizationId,
+      signed.jti,
+      params.ipAddress ?? '',
+      (params.userAgent ?? '').slice(0, 200),
+      params.mfaVerified,
+      signed.expiresAt,
+    ],
+  );
+
+  return signed;
 }
 
-export function verifyTotpCode(secretHex: string, userCode: string): boolean {
-  const clean = userCode.trim();
-  if (!/^\d{6}$/.test(clean)) return false;
-  for (const offset of [-1, 0, 1]) {
-    if (generateTotpCode(secretHex, offset) === clean) return true;
-  }
-  return false;
+export async function revokeSessionByJti(jti: string, organizationId: string): Promise<void> {
+  const pool = getPgPool();
+  await pool.query(
+    `UPDATE user_sessions SET revoked_at = NOW() WHERE token_jti = $1 AND organization_id = $2 AND revoked_at IS NULL`,
+    [jti, organizationId],
+  );
 }
 
-export function writeAuditLog(params: {
+export async function writeAuditLog(params: {
   organizationId: string;
   userId: string;
   userEmail: string;
@@ -117,58 +157,100 @@ export function writeAuditLog(params: {
   resourceId: string;
   details: string;
   ipAddress?: string;
-}): void {
-  db.prepare(`
-    INSERT INTO audit_logs (id, organization_id, user_id, user_email, action, resource_type, resource_id, details, ip_address, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    `aud-${crypto.randomUUID()}`,
-    params.organizationId,
-    params.userId,
-    params.userEmail,
-    params.action,
-    params.resourceType,
-    params.resourceId,
-    params.details,
-    params.ipAddress || '127.0.0.1',
-    new Date().toISOString(),
+}): Promise<void> {
+  const pool = getPgPool();
+  await pool.query(
+    `INSERT INTO audit_logs (organization_id, user_id, user_email, action, resource_type, resource_id, details, ip_address)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::inet)`,
+    [
+      params.organizationId,
+      params.userId,
+      params.userEmail,
+      params.action,
+      params.resourceType,
+      params.resourceId,
+      params.details,
+      params.ipAddress && /^[\da-fA-F:.]+$/.test(params.ipAddress) ? params.ipAddress : '127.0.0.1',
+    ],
   );
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Authentication required. Provide Authorization: Bearer token.' });
-    return;
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Authentication required. Provide Authorization: Bearer token.' });
+      return;
+    }
+
+    const token = authHeader.slice('Bearer '.length).trim();
+    const pool = getPgPool();
+
+    // 1. Check short-lived DB-tracked session token first
+    const localPayload = verifySessionToken(token);
+    if (localPayload) {
+      const sessionRes = await pool.query(
+        `SELECT s.revoked_at, s.expires_at, s.mfa_verified, u.id, u.auth_user_id, u.organization_id, u.email, u.full_name, u.role, u.is_active
+         FROM user_sessions s
+         JOIN users u ON u.id = s.user_id
+         WHERE s.token_jti = $1 AND s.organization_id = $2`,
+        [localPayload.jti, localPayload.oid],
+      );
+      const row = sessionRes.rows[0];
+      if (!row || row.revoked_at || new Date(row.expires_at).getTime() <= Date.now() || !row.is_active) {
+        res.status(401).json({ error: 'Session is expired, revoked, or inactive. Please sign in again.' });
+        return;
+      }
+      req.auth = {
+        userId: row.id,
+        authUserId: row.auth_user_id ?? null,
+        organizationId: row.organization_id,
+        email: row.email,
+        fullName: row.full_name,
+        role: row.role,
+        mfaVerified: Boolean(row.mfa_verified),
+        sessionJti: localPayload.jti,
+      };
+      next();
+      return;
+    }
+
+    // 2. Otherwise verify as a Supabase Auth JWT
+    const supabaseAdmin = getSupabaseAdmin();
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin.auth.getUser(token);
+      if (!error && data?.user) {
+        const userRes = await pool.query(
+          `SELECT id, auth_user_id, organization_id, email, full_name, role, mfa_enabled, is_active
+           FROM users
+           WHERE auth_user_id = $1 OR LOWER(email) = LOWER($2)
+           LIMIT 1`,
+          [data.user.id, data.user.email ?? ''],
+        );
+        const row = userRes.rows[0];
+        if (!row || !row.is_active) {
+          res.status(401).json({ error: 'Account is not provisioned or inactive in MEDIIFY.' });
+          return;
+        }
+        req.auth = {
+          userId: row.id,
+          authUserId: row.auth_user_id ?? data.user.id,
+          organizationId: row.organization_id,
+          email: row.email,
+          fullName: row.full_name,
+          role: row.role,
+          mfaVerified: Boolean(row.mfa_enabled),
+          sessionJti: null,
+        };
+        next();
+        return;
+      }
+    }
+
+    res.status(401).json({ error: 'Invalid or expired authentication token.' });
+  } catch (err) {
+    next(err);
   }
-
-  const token = authHeader.slice('Bearer '.length).trim();
-  const payload = verifySessionToken(token);
-  if (!payload) {
-    res.status(401).json({ error: 'Invalid or expired session token.' });
-    return;
-  }
-
-  const user = db
-    .prepare('SELECT id, organization_id, email, full_name, role, is_active FROM users WHERE id = ? AND organization_id = ?')
-    .get(payload.uid, payload.oid) as
-    | { id: string; organization_id: string; email: string; full_name: string; role: UserRole; is_active: number }
-    | undefined;
-
-  if (!user || user.is_active !== 1) {
-    res.status(401).json({ error: 'User account is inactive or not found.' });
-    return;
-  }
-
-  req.auth = {
-    userId: user.id,
-    organizationId: user.organization_id,
-    email: user.email,
-    fullName: user.full_name,
-    role: user.role,
-    mfaVerified: payload.mfa,
-  };
-  next();
 }
 
 export function requireRole(...allowedRoles: UserRole[]) {
@@ -187,7 +269,6 @@ export function requireRole(...allowedRoles: UserRole[]) {
   };
 }
 
-// In-memory sliding window rate limiter for auth and AI inference routes
 const rateBuckets = new Map<string, number[]>();
 
 export function rateLimit(maxRequests: number, windowMs: number) {

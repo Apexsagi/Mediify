@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   calculateAgeAtDate,
+  checkReferenceDatasetAvailability,
   evaluateDenialRisks,
+  evaluateRevenueIntegrity,
   runDeterministicCodingValidation,
 } from './codingValidator';
 import type {
   CodingRecommendation,
+  EligibilityVerification,
   Encounter,
+  ExtractedEntity,
   NcciEditRule,
   Patient,
   PayerPolicyRule,
@@ -17,14 +21,14 @@ import type {
 const basePatient: Patient = {
   id: 'pat-1',
   organization_id: 'org-1',
-  mrn: 'SYN-1001',
+  mrn: 'MRN-1001',
   first_name: 'Elena',
   last_name: 'Vance',
   dob: '1964-05-12',
   sex: 'F',
   city: 'Boston',
   state: 'MA',
-  is_synthetic: 1,
+  is_synthetic: false,
   created_at: '2026-10-01T00:00:00Z',
 };
 
@@ -39,7 +43,7 @@ const baseEncounter: Encounter = {
   place_of_service: '11',
   chief_complaint: 'Right knee pain and effusion',
   coding_status: 'NEEDS_CODING_REVIEW',
-  is_synthetic: 1,
+  is_synthetic: false,
   created_at: '2026-10-15T10:00:00Z',
 };
 
@@ -150,7 +154,7 @@ const policies: PayerPolicyRule[] = [
 
 function makeRec(partial: Partial<CodingRecommendation>): CodingRecommendation {
   return {
-    id: 'rec-' + Math.random(),
+    id: 'rec-test',
     organization_id: 'org-1',
     encounter_id: 'enc-1',
     code: '99214',
@@ -183,7 +187,25 @@ test('calculateAgeAtDate computes exact age on DOS', () => {
   assert.equal(calculateAgeAtDate('1964-12-12', '2026-10-15'), 61);
 });
 
-test('deterministic validator catches NCCI bundling, missing modifier 25, and MUE overage', () => {
+test('checkReferenceDatasetAvailability blocks validation with MISSING_REFERENCE_DATASET when catalogs are empty', () => {
+  const recs: CodingRecommendation[] = [
+    makeRec({ code: 'M17.11', code_system: 'ICD-10-CM', diagnosis_role: 'PRIMARY' }),
+    makeRec({ code: '99214', code_system: 'CPT' }),
+    makeRec({ code: '20610', code_system: 'CPT' }),
+  ];
+
+  const missing = checkReferenceDatasetAvailability({
+    recommendations: recs,
+    catalog: [],
+    ncciRules: [],
+  });
+
+  assert.ok(missing.some((m) => m.rule_category === 'MISSING_REFERENCE_DATASET' && m.code_involved === 'ICD-10'));
+  assert.ok(missing.some((m) => m.rule_category === 'MISSING_REFERENCE_DATASET' && m.code_involved === 'CPT'));
+  assert.ok(missing.some((m) => m.rule_category === 'MISSING_REFERENCE_DATASET' && m.code_involved === 'NCCI_PTP'));
+});
+
+test('deterministic validator catches NCCI bundling, missing modifier 25, MUE overage, and maps V2 denial categories', () => {
   const recs: CodingRecommendation[] = [
     makeRec({ code: 'M17.11', code_system: 'ICD-10-CM', diagnosis_role: 'PRIMARY' }),
     makeRec({ code: '99214', code_system: 'CPT', modifiers: '' }), // missing mod 25 alongside 20610
@@ -215,11 +237,111 @@ test('deterministic validator catches NCCI bundling, missing modifier 25, and MU
     latestEligibility: null,
     referenceDate: '2026-10-20',
   });
-  assert.ok(denialRisks.some((d) => d.risk_category === 'UNVERIFIED_INSURANCE'));
-  assert.ok(denialRisks.some((d) => d.risk_category === 'NCCI_PTP' && d.severity === 'CRITICAL'));
+  assert.ok(denialRisks.some((d) => d.risk_category === 'UNVERIFIED_ELIGIBILITY'));
+  assert.ok(denialRisks.some((d) => d.risk_category === 'NCCI_BUNDLING_CONFLICT' && d.severity === 'CRITICAL'));
+  assert.ok(denialRisks.some((d) => d.risk_category === 'MUE_UNIT_EXCEEDED' && d.severity === 'HIGH'));
 });
 
-test('deterministic validator passes clean coded encounter with modifier 25 and RT', () => {
+test('evaluateDenialRisks detects inactive coverage and out-of-network eligibility responses', () => {
+  const inactiveEligibility: EligibilityVerification = {
+    id: 'elig-1',
+    organization_id: 'org-1',
+    patient_id: 'pat-1',
+    insurance_policy_id: 'pol-ins-1',
+    verification_source: 'VERIFIED_CLEARINGHOUSE',
+    x12_271_status: 'VERIFIED_INACTIVE',
+    clearinghouse_transaction_id: 'X12-9988',
+    x12_270_payload: null,
+    network_status: 'OUT_OF_NETWORK',
+    copay_amount: null,
+    deductible_remaining: null,
+    coinsurance_percent: null,
+    prior_auth_required: true,
+    referral_required: false,
+    limitations_notes: 'Coverage terminated prior to DOS',
+    verified_at: '2026-10-15T11:00:00Z',
+    created_at: '2026-10-15T11:00:00Z',
+  };
+
+  const denialRisks = evaluateDenialRisks({
+    encounter: baseEncounter,
+    recommendations: [],
+    validations: [],
+    payerPolicies: policies,
+    catalog: sampleCatalog,
+    latestEligibility: inactiveEligibility,
+    referenceDate: '2026-10-20',
+  });
+
+  assert.ok(denialRisks.some((d) => d.risk_category === 'INACTIVE_TERMINATED_INSURANCE' && d.severity === 'CRITICAL'));
+  assert.ok(denialRisks.some((d) => d.risk_category === 'OUT_OF_NETWORK_RISK' && d.severity === 'HIGH'));
+});
+
+test('deterministic validator catches laterality conflicts and outpatient suspected diagnoses', () => {
+  const entities: ExtractedEntity[] = [
+    {
+      id: 'ent-1',
+      organization_id: 'org-1',
+      encounter_id: 'enc-1',
+      medical_record_id: 'doc-1',
+      entity_type: 'procedure',
+      entity_text: 'right knee injection',
+      normalized_concept: 'arthrocentesis major joint',
+      certainty: 'confirmed',
+      laterality: 'RIGHT',
+      anatomical_site: 'Right knee',
+      evidence_snippet: 'Performed right knee injection under sterile prep',
+      page_number: 1,
+      created_at: '2026-10-15T10:00:00Z',
+    },
+    {
+      id: 'ent-2',
+      organization_id: 'org-1',
+      encounter_id: 'enc-1',
+      medical_record_id: 'doc-1',
+      entity_type: 'diagnosis',
+      entity_text: 'suspected osteoarthritis',
+      normalized_concept: 'osteoarthritis',
+      certainty: 'suspected',
+      laterality: 'RIGHT',
+      anatomical_site: 'Right knee',
+      evidence_snippet: 'Rule out right knee osteoarthritis',
+      page_number: 1,
+      created_at: '2026-10-15T10:00:00Z',
+    },
+  ];
+
+  const recs: CodingRecommendation[] = [
+    makeRec({
+      code: 'M17.11',
+      code_system: 'ICD-10-CM',
+      description: 'Unilateral primary osteoarthritis, right knee',
+      diagnosis_role: 'PRIMARY',
+      supporting_evidence: 'Rule out suspected osteoarthritis',
+    }),
+    makeRec({
+      code: '20610',
+      code_system: 'CPT',
+      modifiers: 'LT', // Conflicts with RIGHT entity
+      supporting_evidence: 'Performed right knee injection',
+    }),
+  ];
+
+  const validations = runDeterministicCodingValidation({
+    encounter: baseEncounter,
+    patient: basePatient,
+    recommendations: recs,
+    entities,
+    catalog: sampleCatalog,
+    ncciRules,
+    payerPolicies: policies,
+  });
+
+  assert.ok(validations.some((v) => v.rule_category === 'LATERALITY' && v.severity === 'ERROR'));
+  assert.ok(validations.some((v) => v.policy_reference.includes('IV.H') && v.severity === 'ERROR'));
+});
+
+test('evaluateRevenueIntegrity identifies missed ECG documentation and clean coded encounter passes', () => {
   const recs: CodingRecommendation[] = [
     makeRec({ code: 'M17.11', code_system: 'ICD-10-CM', diagnosis_role: 'PRIMARY' }),
     makeRec({ code: '99214', code_system: 'CPT', modifiers: '25', units: 1 }),
@@ -237,4 +359,29 @@ test('deterministic validator passes clean coded encounter with modifier 25 and 
   });
 
   assert.equal(validations.filter((v) => v.severity === 'ERROR').length, 0);
+
+  const integrityFindings = evaluateRevenueIntegrity({
+    encounter: baseEncounter,
+    entities: [
+      {
+        id: 'ent-ecg',
+        organization_id: 'org-1',
+        encounter_id: 'enc-1',
+        medical_record_id: 'doc-1',
+        entity_type: 'procedure',
+        entity_text: '12-lead ECG',
+        normalized_concept: 'electrocardiogram',
+        certainty: 'confirmed',
+        laterality: 'NONE',
+        anatomical_site: 'Cardiac',
+        evidence_snippet: '12-lead ECG interpreted by attending physician: normal sinus rhythm.',
+        page_number: 2,
+        created_at: '2026-10-15T10:00:00Z',
+      },
+    ],
+    recommendations: recs,
+    validations,
+  });
+
+  assert.ok(integrityFindings.some((f) => f.finding_type === 'MISSED_BILLABLE_DOCUMENTED'));
 });

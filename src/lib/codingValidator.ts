@@ -1,6 +1,7 @@
 import type {
   CodingRecommendation,
   CodingValidationResult,
+  DenialRiskCategory,
   DenialRiskItem,
   EligibilityVerification,
   Encounter,
@@ -44,11 +45,75 @@ function parseModifiers(modStr: string | undefined | null): string[] {
     .filter(Boolean);
 }
 
+export function checkReferenceDatasetAvailability(params: {
+  recommendations: CodingRecommendation[];
+  catalog: ReferenceCode[];
+  ncciRules: NcciEditRule[];
+}): CodingValidationResult[] {
+  const missing: CodingValidationResult[] = [];
+  const systemsNeeded = new Set(params.recommendations.map((r) => r.code_system));
+  const encounterId = params.recommendations[0]?.encounter_id ?? 'check';
+
+  const hasIcd = params.catalog.some((c) => c.code_system === 'ICD-10-CM' || c.code_system === 'ICD-10-PCS');
+  const hasCpt = params.catalog.some((c) => c.code_system === 'CPT');
+  const hasHcpcs = params.catalog.some((c) => c.code_system === 'HCPCS');
+
+  if ((systemsNeeded.has('ICD-10-CM') || systemsNeeded.has('ICD-10-PCS')) && !hasIcd) {
+    missing.push({
+      encounter_id: encounterId,
+      rule_category: 'MISSING_REFERENCE_DATASET',
+      severity: 'ERROR',
+      code_involved: 'ICD-10',
+      message: 'Unable to validate ICD-10 diagnoses/procedures: authoritative ICD-10-CM/PCS dataset has not been imported.',
+      policy_reference: 'MEDIIFY Authoritative Reference Data Requirement',
+      remediation: 'Import CMS ICD-10-CM/PCS reference files via Coding Intelligence -> Dataset Import.',
+    });
+  }
+
+  if (systemsNeeded.has('CPT') && !hasCpt) {
+    missing.push({
+      encounter_id: encounterId,
+      rule_category: 'MISSING_REFERENCE_DATASET',
+      severity: 'ERROR',
+      code_involved: 'CPT',
+      message: 'Unable to validate CPT procedures: licensed AMA CPT reference dataset is not imported.',
+      policy_reference: 'AMA CPT Licensing & Reference Verification Policy',
+      remediation: 'Attest commercial AMA CPT license and import authorized CPT dataset before releasing claims.',
+    });
+  }
+
+  if (systemsNeeded.has('HCPCS') && !hasHcpcs) {
+    missing.push({
+      encounter_id: encounterId,
+      rule_category: 'MISSING_REFERENCE_DATASET',
+      severity: 'ERROR',
+      code_involved: 'HCPCS',
+      message: 'Unable to validate HCPCS Level II codes: authoritative CMS HCPCS dataset is not imported.',
+      policy_reference: 'CMS HCPCS Level II Dataset Requirement',
+      remediation: 'Import CMS HCPCS Level II dataset via Coding Intelligence -> Dataset Import.',
+    });
+  }
+
+  if (params.recommendations.filter((r) => r.code_system === 'CPT' || r.code_system === 'HCPCS').length > 1 && params.ncciRules.length === 0) {
+    missing.push({
+      encounter_id: encounterId,
+      rule_category: 'MISSING_REFERENCE_DATASET',
+      severity: 'ERROR',
+      code_involved: 'NCCI_PTP',
+      message: 'Unable to evaluate NCCI Procedure-to-Procedure bundling: CMS NCCI PTP edit table is empty.',
+      policy_reference: 'CMS NCCI PTP Edit Enforcement Policy',
+      remediation: 'Import CMS NCCI PTP edits before releasing multi-procedure encounters.',
+    });
+  }
+
+  return missing;
+}
+
 /**
  * Independent, deterministic coding rules engine.
- * Evaluates NCCI PTP edits, MUE unit limits, LCD/NCD medical necessity,
- * laterality, duplicate procedures, age/sex restrictions, global surgery rules,
- * modifier compatibility, and DOS effective dates.
+ * Evaluates authoritative dataset presence, NCCI PTP edits, MUE unit limits,
+ * LCD/NCD medical necessity, laterality, duplicate procedures, age/sex restrictions,
+ * global surgery rules, modifier compatibility, and DOS effective dates.
  */
 export function runDeterministicCodingValidation(
   input: DeterministicValidationInput,
@@ -59,6 +124,16 @@ export function runDeterministicCodingValidation(
   const dos = encounter.date_of_service;
   const ageAtDos = calculateAgeAtDate(patient.dob, dos);
 
+  // 0. Mandatory Authoritative Dataset Check (blocks validation instead of faking PASS)
+  const missingDatasets = checkReferenceDatasetAvailability({
+    recommendations: activeRecs,
+    catalog,
+    ncciRules,
+  });
+  if (missingDatasets.length > 0) {
+    results.push(...missingDatasets);
+  }
+
   const catalogByCode = new Map<string, ReferenceCode>();
   for (const c of catalog) {
     catalogByCode.set(`${c.code_system}:${c.code.toUpperCase()}`, c);
@@ -67,9 +142,7 @@ export function runDeterministicCodingValidation(
     }
   }
 
-  const diagnosisCodes = activeRecs.filter(
-    (r) => r.code_system === 'ICD-10-CM',
-  );
+  const diagnosisCodes = activeRecs.filter((r) => r.code_system === 'ICD-10-CM');
   const procedureRecs = activeRecs.filter(
     (r) => r.code_system === 'CPT' || r.code_system === 'HCPCS' || r.code_system === 'ICD-10-PCS',
   );
@@ -88,12 +161,11 @@ export function runDeterministicCodingValidation(
         code_involved: rec.code,
         message: `Code ${rec.code} (${rec.code_system}) is not present in the authoritative reference database.`,
         policy_reference: 'MEDIIFY Authoritative Code Master',
-        remediation: 'Replace with a verified code from the active ICD-10/CPT/HCPCS explorer.',
+        remediation: 'Import the authoritative dataset containing this code or select a verified code from the explorer.',
       });
       continue;
     }
 
-    // Effective / Expiration date validation
     if (dos < ref.effective_date || (ref.expiration_date && dos > ref.expiration_date)) {
       results.push({
         encounter_id: encounter.id,
@@ -106,7 +178,6 @@ export function runDeterministicCodingValidation(
       });
     }
 
-    // MUE validation
     if (ref.mue_limit !== null && rec.units > ref.mue_limit) {
       results.push({
         encounter_id: encounter.id,
@@ -119,7 +190,6 @@ export function runDeterministicCodingValidation(
       });
     }
 
-    // Age & Gender restrictions
     if (ageAtDos !== null) {
       if (ref.age_min !== null && ageAtDos < ref.age_min) {
         results.push({
@@ -157,9 +227,9 @@ export function runDeterministicCodingValidation(
       });
     }
 
-    // Laterality validation
     const mods = parseModifiers(rec.modifiers);
-    if (ref.requires_laterality === 1) {
+    const requiresLat = ref.requires_laterality === 1 || ref.requires_laterality === true;
+    if (requiresLat) {
       const hasLateralityMod = mods.some((m) => m === 'LT' || m === 'RT' || m === '50');
       const codeUpper = rec.code.toUpperCase();
       const descLower = ref.description.toLowerCase();
@@ -191,7 +261,6 @@ export function runDeterministicCodingValidation(
         });
       }
 
-      // Cross-check extracted laterality vs assigned modifier or description
       const matchingEntity = entities.find(
         (e) =>
           (e.laterality === 'LEFT' || e.laterality === 'RIGHT' || e.laterality === 'BILATERAL') &&
@@ -291,7 +360,7 @@ export function runDeterministicCodingValidation(
     }
   }
 
-  // 4. Global Surgery & Modifier 25 Check
+  // 4. Global Surgery & Modifier 25/57 Check
   const emCodes = procedureRecs.filter((p) => /^992(0[2-5]|1[1-5]|8[1-5])$/.test(p.code));
   const surgicalCodes = procedureRecs.filter((p) => {
     const ref = catalogByCode.get(`CPT:${p.code}`) ?? catalogByCode.get(p.code);
@@ -349,7 +418,6 @@ export function runDeterministicCodingValidation(
       }
     }
 
-    // Check diagnosis pointers on procedures
     if ((proc.code_system === 'CPT' || proc.code_system === 'HCPCS') && diagnosisCodes.length > 0 && !proc.diagnosis_pointers?.trim()) {
       results.push({
         encounter_id: encounter.id,
@@ -401,10 +469,29 @@ export function runDeterministicCodingValidation(
   return results;
 }
 
+function mapValidationToDenialCategory(ruleCat: CodingValidationResult['rule_category']): DenialRiskCategory {
+  switch (ruleCat) {
+    case 'NCCI_PTP':
+      return 'NCCI_BUNDLING_CONFLICT';
+    case 'MUE':
+      return 'MUE_UNIT_EXCEEDED';
+    case 'LCD_NCD_MEDICAL_NECESSITY':
+      return 'MEDICAL_NECESSITY_FAILURE';
+    case 'DUPLICATE_PROCEDURE':
+      return 'DUPLICATE_BILLING';
+    case 'LATERALITY':
+      return 'LACK_OF_DIAGNOSIS_SPECIFICITY';
+    case 'MISSING_REFERENCE_DATASET':
+      return 'MISSING_REFERENCE_DATASET';
+    default:
+      return 'MISSING_INVALID_MODIFIER';
+  }
+}
+
 /**
- * Deterministic AI Denial Prevention Engine.
- * Produces structured risk items with severity, evidence, policy, and corrective actions.
- * Never fabricates unvalidated AI denial probability percentages.
+ * Centralized Deterministic Denial Prevention Engine.
+ * Covers all 12 V2 denial categories + missing reference datasets.
+ * Never fabricates denial probability percentages or simulated financial estimates.
  */
 export function evaluateDenialRisks(input: {
   encounter: Encounter;
@@ -419,97 +506,126 @@ export function evaluateDenialRisks(input: {
   const { encounter, recommendations, validations, payerPolicies, catalog, latestEligibility, referenceDate } = input;
   const activeRecs = recommendations.filter((r) => r.approval_status !== 'REJECTED');
 
-  // 1. Validation failures become concrete denial risks
+  // 1. Validation failures mapped into standardized denial categories
   for (const val of validations) {
-    if (val.severity === 'ERROR') {
+    if (val.severity === 'ERROR' || val.severity === 'WARNING') {
+      const category = mapValidationToDenialCategory(val.rule_category);
       risks.push({
         encounter_id: encounter.id,
-        risk_category: val.rule_category,
-        severity: val.rule_category === 'NCCI_PTP' || val.rule_category === 'LCD_NCD_MEDICAL_NECESSITY' ? 'CRITICAL' : 'HIGH',
+        risk_category: category,
+        severity:
+          val.severity === 'ERROR'
+            ? val.rule_category === 'NCCI_PTP' ||
+              val.rule_category === 'LCD_NCD_MEDICAL_NECESSITY' ||
+              val.rule_category === 'MISSING_REFERENCE_DATASET'
+              ? 'CRITICAL'
+              : 'HIGH'
+            : 'MEDIUM',
         supporting_evidence: val.message,
         applicable_policy: val.policy_reference,
-        recommended_action: val.remediation,
-        review_status: 'OPEN',
-      });
-    } else if (val.severity === 'WARNING') {
-      risks.push({
-        encounter_id: encounter.id,
-        risk_category: val.rule_category,
-        severity: 'MEDIUM',
-        supporting_evidence: val.message,
-        applicable_policy: val.policy_reference,
+        source_reference: val.code_involved,
         recommended_action: val.remediation,
         review_status: 'OPEN',
       });
     }
   }
 
-  // 2. Insurance Eligibility & Inactive Coverage Risk
+  // 2. Insurance Eligibility, Inactive Coverage, and Out-of-Network Risk
   if (!latestEligibility) {
     risks.push({
       encounter_id: encounter.id,
-      risk_category: 'UNVERIFIED_INSURANCE',
+      risk_category: 'UNVERIFIED_ELIGIBILITY',
       severity: 'HIGH',
       supporting_evidence: 'No eligibility verification record exists for this patient/encounter.',
       applicable_policy: 'Payer Eligibility & X12 270/271 Pre-Bill Requirement',
+      source_reference: encounter.encounter_number,
       recommended_action: 'Run authorized clearinghouse/FHIR eligibility verification prior to claim submission.',
       review_status: 'OPEN',
     });
-  } else if (latestEligibility.x12_271_status === 'VERIFIED_INACTIVE') {
-    risks.push({
-      encounter_id: encounter.id,
-      risk_category: 'INACTIVE_INSURANCE',
-      severity: 'CRITICAL',
-      supporting_evidence: 'Clearinghouse 271 response reports inactive coverage on Date of Service.',
-      applicable_policy: 'Payer Coverage Effective Date Requirement',
-      recommended_action: 'Verify alternate/secondary payer coverage or update patient guarantor billing.',
-      review_status: 'OPEN',
-    });
-  } else if (latestEligibility.x12_271_status === 'NOT_VERIFIED_REQUIRES_CLEARINGHOUSE') {
-    risks.push({
-      encounter_id: encounter.id,
-      risk_category: 'UNVERIFIED_INSURANCE',
-      severity: 'MEDIUM',
-      supporting_evidence: 'Insurance information was extracted from clinical/intake documents only; not yet verified via authorized clearinghouse.',
-      applicable_policy: 'Clearinghouse Verification Control',
-      recommended_action: 'Configure authorized X12 270/271 or FHIR Coverage connector to verify active benefits.',
-      review_status: 'OPEN',
-    });
-  }
-
-  // 3. Prior Authorization Requirement Risk
-  for (const rec of activeRecs) {
-    const ref = catalog.find((c) => c.code === rec.code && c.code_system === rec.code_system);
-    const matchingPolicy = payerPolicies.find((p) => p.procedure_codes.includes(rec.code) && p.prior_auth_required === 1);
-    if ((ref?.prior_auth_typical === 1 || matchingPolicy) && !latestEligibility?.prior_auth_required) {
+  } else {
+    if (latestEligibility.x12_271_status === 'VERIFIED_INACTIVE') {
       risks.push({
         encounter_id: encounter.id,
-        risk_category: 'MISSING_PRIOR_AUTH',
+        risk_category: 'INACTIVE_TERMINATED_INSURANCE',
+        severity: 'CRITICAL',
+        supporting_evidence: 'Clearinghouse 271 response reports inactive/terminated coverage on Date of Service.',
+        applicable_policy: 'Payer Coverage Effective Date Requirement',
+        source_reference: latestEligibility.clearinghouse_transaction_id ?? latestEligibility.id,
+        recommended_action: 'Verify alternate/secondary payer coverage or update patient guarantor billing.',
+        review_status: 'OPEN',
+      });
+    } else if (
+      latestEligibility.x12_271_status === 'NOT_VERIFIED_REQUIRES_CLEARINGHOUSE' ||
+      latestEligibility.x12_271_status === 'ERROR'
+    ) {
+      risks.push({
+        encounter_id: encounter.id,
+        risk_category: 'UNVERIFIED_ELIGIBILITY',
+        severity: 'MEDIUM',
+        supporting_evidence: `Eligibility not verified via clearinghouse (source: ${latestEligibility.verification_source}).`,
+        applicable_policy: 'Clearinghouse Verification Control',
+        source_reference: latestEligibility.id,
+        recommended_action: 'Connect authorized X12 270/271 or FHIR Coverage connector to verify active benefits.',
+        review_status: 'OPEN',
+      });
+    }
+
+    if (latestEligibility.network_status === 'OUT_OF_NETWORK') {
+      risks.push({
+        encounter_id: encounter.id,
+        risk_category: 'OUT_OF_NETWORK_RISK',
+        severity: 'HIGH',
+        supporting_evidence: 'Eligibility verification indicates Out-of-Network provider/benefit status.',
+        applicable_policy: 'Payer Network & Out-of-Network Authorization Policy',
+        source_reference: latestEligibility.id,
+        recommended_action: 'Confirm out-of-network benefits, single-case agreement, or member responsibility disclosure.',
+        review_status: 'OPEN',
+      });
+    }
+  }
+
+  // 3. Missing Prior Authorization
+  for (const rec of activeRecs) {
+    const ref = catalog.find((c) => c.code === rec.code && c.code_system === rec.code_system);
+    const matchingPolicy = payerPolicies.find(
+      (p) => p.procedure_codes.includes(rec.code) && (p.prior_auth_required === 1 || p.prior_auth_required === true),
+    );
+    const priorAuthFlag = ref?.prior_auth_typical === 1 || ref?.prior_auth_typical === true;
+    const eligNeedsAuth = latestEligibility?.prior_auth_required === 1 || latestEligibility?.prior_auth_required === true;
+    if ((priorAuthFlag || matchingPolicy) && !eligNeedsAuth) {
+      risks.push({
+        encounter_id: encounter.id,
+        risk_category: 'MISSING_PRIOR_AUTHORIZATION',
         severity: 'HIGH',
         supporting_evidence: `Procedure ${rec.code} typically requires payer prior authorization; no authorization number is documented.`,
         applicable_policy: matchingPolicy ? `${matchingPolicy.policy_type} ${matchingPolicy.policy_code}` : 'Payer Prior Authorization Policy',
+        source_reference: `${rec.source_document} p.${rec.page_reference}`,
         recommended_action: 'Attach approved prior authorization number or verify payer exemption before claim release.',
         review_status: 'OPEN',
       });
     }
   }
 
-  // 4. Incomplete Clinical Documentation Risk
+  // 4. Incomplete Clinical Documentation & Diagnosis Specificity
   for (const rec of activeRecs) {
     if (rec.documentation_completeness !== 'COMPLETE') {
       risks.push({
         encounter_id: encounter.id,
-        risk_category: 'INCOMPLETE_DOCUMENTATION',
+        risk_category:
+          rec.documentation_completeness === 'MISSING_SPECIFICITY'
+            ? 'LACK_OF_DIAGNOSIS_SPECIFICITY'
+            : 'INCOMPLETE_CLINICAL_DOCUMENTATION',
         severity: 'MEDIUM',
-        supporting_evidence: `Code ${rec.code} flagged with documentation completeness '${rec.documentation_completeness}': ${rec.compliance_risk || 'Requires additional clinical specificity.'}`,
+        supporting_evidence: `Code ${rec.code} flagged as '${rec.documentation_completeness}': ${rec.compliance_risk || 'Requires additional clinical specificity.'}`,
         applicable_policy: 'CMS Documentation Integrity Standards',
+        source_reference: `${rec.source_document} p.${rec.page_reference}`,
         recommended_action: 'Initiate physician query or review source chart pages before final sign-off.',
         review_status: 'OPEN',
       });
     }
   }
 
-  // 5. Timely Filing Check (e.g., 90-day standard threshold)
+  // 5. Timely Filing Risk (90-day standard commercial threshold)
   const evalDate = referenceDate ? new Date(referenceDate) : new Date();
   const dosDate = new Date(encounter.date_of_service);
   if (!Number.isNaN(evalDate.getTime()) && !Number.isNaN(dosDate.getTime())) {
@@ -517,10 +633,11 @@ export function evaluateDenialRisks(input: {
     if (daysElapsed > 75) {
       risks.push({
         encounter_id: encounter.id,
-        risk_category: 'TIMELY_FILING',
+        risk_category: 'TIMELY_FILING_RISK',
         severity: daysElapsed > 90 ? 'CRITICAL' : 'HIGH',
         supporting_evidence: `${daysElapsed} days have elapsed since Date of Service (${encounter.date_of_service}).`,
         applicable_policy: 'Payer Timely Filing Limit (90-Day Commercial / 12-Month Medicare)',
+        source_reference: encounter.encounter_number,
         recommended_action: 'Expedite coding review and claim submission immediately to prevent timely-filing denial.',
         review_status: 'OPEN',
       });
@@ -530,11 +647,6 @@ export function evaluateDenialRisks(input: {
   return risks;
 }
 
-/**
- * Revenue Integrity Engine:
- * Balances missed documented billable opportunities against overcoding/unbundling risks.
- * Always prioritizes compliant accuracy over maximizing payment.
- */
 export function evaluateRevenueIntegrity(input: {
   encounter: Encounter;
   entities: ExtractedEntity[];
@@ -547,7 +659,6 @@ export function evaluateRevenueIntegrity(input: {
     recommendations.filter((r) => r.approval_status !== 'REJECTED').map((r) => r.code.toUpperCase()),
   );
 
-  // Detect documented procedures not represented in recommendations
   const documentedProcedures = entities.filter(
     (e) => e.entity_type === 'procedure' && e.certainty === 'confirmed',
   );
@@ -569,7 +680,6 @@ export function evaluateRevenueIntegrity(input: {
     }
   }
 
-  // Detect overcoding / improper unbundling from NCCI / Global surgery validations
   for (const val of validations) {
     if (val.severity === 'ERROR' && (val.rule_category === 'NCCI_PTP' || val.rule_category === 'GLOBAL_SURGERY')) {
       findings.push({
@@ -585,7 +695,6 @@ export function evaluateRevenueIntegrity(input: {
     }
   }
 
-  // Detect chronic condition specificity gaps (undercoding severity/MCC/CC)
   const unspecifiedDx = recommendations.filter(
     (r) =>
       r.code_system === 'ICD-10-CM' &&

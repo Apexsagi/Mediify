@@ -12,7 +12,7 @@ CREATE TABLE organizations (
   specialty TEXT NOT NULL,
   retention_days INTEGER NOT NULL DEFAULT 2555,
   baa_attested BOOLEAN NOT NULL DEFAULT FALSE,
-  synthetic_mode BOOLEAN NOT NULL DEFAULT TRUE,
+  synthetic_mode BOOLEAN NOT NULL DEFAULT FALSE,
   onboarding_completed BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -28,10 +28,12 @@ CREATE TABLE users (
   auth_user_id UUID UNIQUE,
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
   email TEXT NOT NULL UNIQUE,
+  password_hash TEXT,
   full_name TEXT NOT NULL,
   role TEXT NOT NULL REFERENCES roles_permissions(role),
   credentials TEXT NOT NULL DEFAULT '',
   mfa_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  mfa_secret TEXT,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -56,7 +58,7 @@ CREATE TABLE patients (
   sex CHAR(1) NOT NULL,
   city TEXT NOT NULL DEFAULT '',
   state CHAR(2) NOT NULL DEFAULT '',
-  is_synthetic BOOLEAN NOT NULL DEFAULT TRUE,
+  is_synthetic BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (organization_id, mrn)
 );
@@ -72,7 +74,7 @@ CREATE TABLE encounters (
   place_of_service TEXT NOT NULL DEFAULT '11',
   chief_complaint TEXT NOT NULL,
   coding_status TEXT NOT NULL DEFAULT 'NEEDS_CODING_REVIEW',
-  is_synthetic BOOLEAN NOT NULL DEFAULT TRUE,
+  is_synthetic BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

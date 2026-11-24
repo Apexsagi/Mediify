@@ -11,6 +11,7 @@ import type { AIModelConfig, CertaintyStatus, CodeSystem, ReferenceCode } from '
 export interface ClinicalExtractionResult {
   providerUsed: string;
   modelUsed: string;
+  latencyMs: number;
   promptInjectionDetected: boolean;
   matchedInjectionPatterns: string[];
   extractedEntities: Array<{
@@ -82,9 +83,16 @@ export function validateExternalInferenceUrl(rawUrl: string): { valid: boolean; 
   return { valid: true };
 }
 
+function resolveProviderCredential(providerType: AIModelConfig['provider_type']): string | undefined {
+  if (providerType === 'gemini') return process.env.GEMINI_API_KEY?.trim();
+  if (providerType === 'lingsante') return process.env.LINGSANTE_API_KEY?.trim();
+  if (providerType === 'huggingface') return process.env.HUGGINGFACE_API_TOKEN?.trim();
+  return process.env.OPENAI_COMPATIBLE_API_KEY?.trim();
+}
+
 function buildCodingSystemInstruction(catalog: ReferenceCode[]): string {
   const catalogList = catalog
-    .filter((c) => c.is_billable === 1)
+    .filter((c) => c.is_billable === 1 || c.is_billable === true)
     .map((c) => `${c.code_system} ${c.code}: ${c.description}`)
     .join('\n');
 
@@ -97,7 +105,94 @@ CRITICAL SAFETY RULES:
 5. Every coding recommendation must cite an exact verbatim supporting_evidence quote from the document.
 
 AUTHORITATIVE CODE CATALOG:
-${catalogList}`;
+${catalogList || '(NO REFERENCE CODES IMPORTED — RETURN EMPTY RECOMMENDATIONS ARRAY)'}`;
+}
+
+/**
+ * Executes a real upstream health probe against the configured AI provider
+ * and returns measured latency and status without fabricating availability.
+ */
+export async function checkAiProviderHealth(modelConfig: AIModelConfig): Promise<{
+  status: AIModelConfig['last_health_status'];
+  message: string;
+  latencyMs: number | null;
+}> {
+  const token = resolveProviderCredential(modelConfig.provider_type);
+  if (!token) {
+    return {
+      status: 'UNCONFIGURED',
+      message: `Required server-side secret for ${modelConfig.provider_type} is not configured.`,
+      latencyMs: null,
+    };
+  }
+
+  const startedAt = Date.now();
+  if (modelConfig.provider_type === 'gemini') {
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: token,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+      });
+      await ai.models.get({ model: modelConfig.model_name || 'gemini-2.5-flash' });
+      const latencyMs = Date.now() - startedAt;
+      return {
+        status: 'HEALTHY',
+        message: `Verified upstream Gemini model "${modelConfig.model_name}" reachability (${latencyMs}ms).`,
+        latencyMs,
+      };
+    } catch (err) {
+      const latencyMs = Date.now() - startedAt;
+      return {
+        status: 'UNREACHABLE',
+        message: `Gemini upstream probe failed: ${err instanceof Error ? err.message : 'Request error'}`,
+        latencyMs,
+      };
+    }
+  }
+
+  const urlCheck = validateExternalInferenceUrl(modelConfig.api_url);
+  if (!urlCheck.valid) {
+    return {
+      status: modelConfig.api_url ? 'UNREACHABLE' : 'UNCONFIGURED',
+      message: urlCheck.reason ?? 'Endpoint URL invalid or missing.',
+      latencyMs: null,
+    };
+  }
+
+  try {
+    const resp = await fetch(modelConfig.api_url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        model: modelConfig.model_name,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'ping' }],
+      }),
+      signal: AbortSignal.timeout(Math.min(modelConfig.timeout_ms || 10000, 10000)),
+    });
+    const latencyMs = Date.now() - startedAt;
+    if (resp.status >= 500 || resp.status === 401 || resp.status === 403 || resp.status === 404) {
+      return {
+        status: 'UNREACHABLE',
+        message: `Endpoint returned HTTP ${resp.status}.`,
+        latencyMs,
+      };
+    }
+    return {
+      status: 'HEALTHY',
+      message: `Verified upstream ${modelConfig.provider_type} endpoint (${resp.status}, ${latencyMs}ms).`,
+      latencyMs,
+    };
+  } catch (err) {
+    return {
+      status: 'UNREACHABLE',
+      message: err instanceof Error ? err.message : 'Endpoint unreachable.',
+      latencyMs: Date.now() - startedAt,
+    };
+  }
 }
 
 export async function runClinicalExtractionAndCoding(params: {
@@ -112,10 +207,16 @@ export async function runClinicalExtractionAndCoding(params: {
 }): Promise<ClinicalExtractionResult> {
   const { modelConfig, documentName, rawText, binaryBase64, encounterType, dateOfService, catalog, orgIsSynthetic } = params;
 
-  // HIPAA PHI Guardrail: Block non-synthetic organizations from sending real PHI to unapproved AI providers
-  if (!orgIsSynthetic && modelConfig.approved_for_phi !== 1) {
+  const approvedForPhi = modelConfig.approved_for_phi === 1 || modelConfig.approved_for_phi === true;
+  if (!orgIsSynthetic && !approvedForPhi) {
     throw new Error(
-      `Compliance Guardrail: Provider "${modelConfig.display_name}" is not approved for real ePHI (BAA status: ${modelConfig.baa_status}). Enable an approved BAA-covered endpoint or use synthetic sandbox mode.`,
+      `Compliance Guardrail: Provider "${modelConfig.display_name}" is not approved for real ePHI (BAA status: ${modelConfig.baa_status}). Enable a BAA-executed endpoint before processing patient records.`,
+    );
+  }
+
+  if (catalog.length === 0) {
+    throw new Error(
+      'Unable to validate AI coding recommendations: no authoritative medical code catalog has been imported yet.',
     );
   }
 
@@ -124,10 +225,11 @@ export async function runClinicalExtractionAndCoding(params: {
   const systemInstruction = buildCodingSystemInstruction(catalog);
   const userPrompt = `Analyze this ${encounterType} clinical encounter (Date of Service: ${dateOfService}) and return structured JSON with extracted clinical entities and evidence-supported coding recommendations.\n\n${wrappedDoc}`;
 
+  const startedAt = Date.now();
   let rawJsonText = '';
 
   if (modelConfig.provider_type === 'gemini') {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = resolveProviderCredential('gemini');
     if (!apiKey) {
       throw new Error('GEMINI_API_KEY is not configured in server environment secrets.');
     }
@@ -148,7 +250,7 @@ export async function runClinicalExtractionAndCoding(params: {
     parts.push({ text: userPrompt });
 
     const response = await ai.models.generateContent({
-      model: modelConfig.model_name || 'gemini-4-hydrogen',
+      model: modelConfig.model_name || 'gemini-2.5-flash',
       contents: { parts },
       config: {
         systemInstruction,
@@ -201,19 +303,13 @@ export async function runClinicalExtractionAndCoding(params: {
 
     rawJsonText = (response.text ?? '{}').trim();
   } else {
-    // LingSante-3.1-air-VL, HuggingFace Inference, or OpenAI-Compatible Server-Side Endpoint
+    // inclusionAI/LingSante-3.1-air-VL, HuggingFace Inference, or OpenAI-Compatible Server-Side Endpoint
     const urlCheck = validateExternalInferenceUrl(modelConfig.api_url);
     if (!urlCheck.valid) {
       throw new Error(`${modelConfig.display_name} endpoint invalid: ${urlCheck.reason}`);
     }
 
-    const token =
-      modelConfig.provider_type === 'lingsante'
-        ? process.env.LINGSANTE_API_KEY
-        : modelConfig.provider_type === 'huggingface'
-          ? process.env.HUGGINGFACE_API_TOKEN
-          : process.env.OPENAI_COMPATIBLE_API_KEY;
-
+    const token = resolveProviderCredential(modelConfig.provider_type);
     if (!token) {
       throw new Error(
         `Missing server-side credential environment variable for ${modelConfig.provider_type} (${modelConfig.model_name}).`,
@@ -224,6 +320,17 @@ export async function runClinicalExtractionAndCoding(params: {
     const timeoutId = setTimeout(() => controller.abort(), modelConfig.timeout_ms || 30000);
 
     try {
+      const userContent: unknown =
+        modelConfig.provider_type === 'lingsante' && binaryBase64 && binaryBase64.mimeType.startsWith('image/')
+          ? [
+              { type: 'text', text: userPrompt },
+              {
+                type: 'image_url',
+                image_url: { url: `data:${binaryBase64.mimeType};base64,${binaryBase64.data}` },
+              },
+            ]
+          : userPrompt;
+
       const resp = await fetch(modelConfig.api_url, {
         method: 'POST',
         headers: {
@@ -236,7 +343,7 @@ export async function runClinicalExtractionAndCoding(params: {
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: systemInstruction },
-            { role: 'user', content: userPrompt },
+            { role: 'user', content: userContent },
           ],
         }),
         signal: controller.signal,
@@ -257,6 +364,8 @@ export async function runClinicalExtractionAndCoding(params: {
     }
   }
 
+  const latencyMs = Date.now() - startedAt;
+
   let parsedJson: unknown;
   try {
     parsedJson = JSON.parse(rawJsonText);
@@ -269,7 +378,6 @@ export async function runClinicalExtractionAndCoding(params: {
     throw new Error(`AI structured response failed schema validation: ${validated.error.issues[0]?.message ?? 'Invalid schema'}`);
   }
 
-  // Authoritative Hallucination Guard against DOS-valid reference catalog
   const catalogCheck = verifyRecommendationsAgainstCatalog(
     validated.data.recommendations,
     catalog,
@@ -279,6 +387,7 @@ export async function runClinicalExtractionAndCoding(params: {
   return {
     providerUsed: modelConfig.provider_type,
     modelUsed: modelConfig.model_name,
+    latencyMs,
     promptInjectionDetected: sanitization.injectionDetected,
     matchedInjectionPatterns: sanitization.matchedPatterns,
     extractedEntities: validated.data.entities,
@@ -287,22 +396,61 @@ export async function runClinicalExtractionAndCoding(params: {
   };
 }
 
-export async function performGeminiOcrExtraction(params: {
+export async function performMultimodalOcrExtraction(params: {
   mimeType: string;
   base64Data: string;
   fileName: string;
+  activeModelConfig?: AIModelConfig | null;
 }): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is required for multimodal PDF/image OCR.');
+  // Use active LingSante VLM if configured and approved, otherwise Gemini if configured. Never silent-switch unapproved models.
+  const cfg = params.activeModelConfig;
+  if (cfg && cfg.provider_type === 'lingsante' && cfg.api_url && process.env.LINGSANTE_API_KEY && params.mimeType.startsWith('image/')) {
+    const urlCheck = validateExternalInferenceUrl(cfg.api_url);
+    if (!urlCheck.valid) throw new Error(urlCheck.reason);
+
+    const resp = await fetch(cfg.api_url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.LINGSANTE_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model_name,
+        max_tokens: cfg.max_tokens || 4096,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `Perform verbatim clinical OCR transcription on "${params.fileName}". Preserve section headings, [PAGE N] markers, diagnoses, procedures, laterality, lab values, and signatures.`,
+              },
+              { type: 'image_url', image_url: { url: `data:${params.mimeType};base64,${params.base64Data}` } },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(cfg.timeout_ms || 30000),
+    });
+    if (!resp.ok) {
+      throw new Error(`LingSante OCR error (${resp.status})`);
+    }
+    const json = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    return (json.choices?.[0]?.message?.content ?? '').trim();
   }
+
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error('Server-side OCR credential (GEMINI_API_KEY or LingSante endpoint) is not configured.');
+  }
+
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
   });
 
   const resp = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
+    model: cfg?.provider_type === 'gemini' && cfg.model_name ? cfg.model_name : 'gemini-2.5-flash',
     contents: {
       parts: [
         { inlineData: { mimeType: params.mimeType, data: params.base64Data } },
